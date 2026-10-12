@@ -84,10 +84,11 @@ struct SplashServerState {
     var peakGB: Double = 0
     var contextTokens: Int? = nil
     var lastLog: String? = nil        // latest log line while starting (download/hash progress)
+    var engine = "Splash"             // "Splish" for a server run from a Splish checkout
 
     var id: String { label ?? "pid:\(pid ?? 0)" }
     var configured: Bool { label != nil }
-    var displayName: String { model ?? agentModel ?? "splash" }
+    var displayName: String { model ?? agentModel ?? engine.lowercased() }
     /// Drop the "org/" prefix for the row; the tooltip keeps the full id.
     var shortName: String { shortModelName(displayName) }
 }
@@ -163,6 +164,8 @@ final class PanelModel {
     var splashInstalled: [String] = []     // "org/repo:VARIANT" already in Splash's model store
     var mlxCached: [MlxCachedModel] = []
     var splashLanguageOnly: Set<String> = []  // Splash installs made with --language-only
+    var splishInstalled: Set<String> = []     // installs in the Splish checkout's own store
+    var splashStoreInstalled: Set<String> = [] // installs in Splash's store
     var library: LibrarySnapshot?
 
     var hfFormat: HFFormat = HFFormat(rawValue: UserDefaults.standard.string(forKey: "hfFormat") ?? "") ?? .gguf {
@@ -524,7 +527,7 @@ final class PressureGraphView: NSView {
             for m in snap.models {
                 print("\(m.name)  [\(m.instances.map(\.backend.badge).joined())]  \(gb(m.sizeBytes)) GB  key=\(m.key)")
                 for i in m.instances {
-                    print("    \(i.backend.title): \(i.ref)  files=\(i.files.count)  alone-frees=\(gb(LibraryScanner.bytesFreed([i], in: snap))) GB")
+                    print("    \(i.place): \(i.ref)  files=\(i.files.count)  alone-frees=\(gb(LibraryScanner.bytesFreed([i], in: snap))) GB")
                 }
             }
             print("disk \(gb(snap.diskBytes)) GB · free \(gb(snap.freeBytes)) GB · stored twice \(gb(snap.duplicateBytes)) GB")
@@ -587,6 +590,8 @@ final class PressureGraphView: NSView {
             // Debug-only: `--hf-search <query>` runs a Hugging Face search for screenshots.
             if let i = CommandLine.arguments.firstIndex(of: "--hf-search"), i + 1 < CommandLine.arguments.count {
                 searchHF(CommandLine.arguments[i + 1], recentOnly: true)
+                (NSApp.windows.first { $0.title == "Local AI Manager" }?.contentView as? PanelContentView)?
+                    .showSearchQuery(CommandLine.arguments[i + 1])
             }
             captureDebugShotIfRequested()
         }
@@ -613,6 +618,45 @@ final class PressureGraphView: NSView {
 
     private func snapshotDebugWindow(to path: String) {
         guard let win = NSApp.windows.first(where: { $0.title == "Local AI Manager" }) else { return }
+        // `--hidpi`: draw the panel off-screen at 2x (README images on a 1x display). Liquid Glass
+        // doesn't draw off-screen, so its contents go over a flat card of the glass's on-screen color.
+        if CommandLine.arguments.contains("--hidpi"), let content = win.contentView {
+            func findGlass(_ v: NSView) -> NSGlassEffectView? {
+                (v as? NSGlassEffectView) ?? v.subviews.lazy.compactMap(findGlass).first
+            }
+            win.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            content.layoutSubtreeIfNeeded()
+            guard let glass = findGlass(content),
+                  let root = glass.subviews.first(where: { $0 is NSStackView }) else { return }
+            func hiRep(_ size: NSSize) -> NSBitmapImageRep? {
+                let rep = NSBitmapImageRep(
+                    bitmapDataPlanes: nil, pixelsWide: Int(size.width * 2), pixelsHigh: Int(size.height * 2),
+                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+                rep?.size = size
+                return rep
+            }
+            // trim the card to the content (the window can be taller than the current tab needs)
+            var frame = glass.convert(root.bounds, from: root)
+            if glass.isFlipped { frame.origin.y = glass.bounds.height - frame.maxY }
+            let topMargin = glass.bounds.height - frame.maxY
+            let shown = (root as? NSStackView)?.arrangedSubviews.filter { !$0.isHidden } ?? []
+            let used = shown.map { root.isFlipped ? $0.frame.maxY : root.bounds.height - $0.frame.minY }.max() ?? frame.height
+            let size = NSSize(width: glass.bounds.width, height: topMargin + used + min(frame.minY, 12))
+            frame.origin.y = size.height - topMargin - frame.height
+            guard let out = hiRep(size), let inner = hiRep(root.bounds.size) else { return }
+            root.cacheDisplay(in: root.bounds, to: inner)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: out)
+            let dark = win.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            NSColor(white: dark ? 45 / 255 : 246 / 255, alpha: 1).setFill()
+            NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: 24, yRadius: 24).fill()
+            inner.draw(in: frame, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            NSGraphicsContext.restoreGraphicsState()
+            try? out.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+            return
+        }
         let windowID = CGWindowID(win.windowNumber)
         let pxW = Int(win.frame.width * win.backingScaleFactor)
         let pxH = Int(win.frame.height * win.backingScaleFactor)
@@ -953,16 +997,61 @@ final class PressureGraphView: NSView {
     static let splashCLI = AppPaths.firstExecutable(["~/.local/bin/splash", "/opt/homebrew/bin/splash", "/usr/local/bin/splash"])
         ?? NSString(string: "~/.local/bin/splash").expandingTildeInPath
     static let splashModelsDir = NSString(string: "~/Library/Application Support/Splash/models").expandingTildeInPath
+
+    /// A Splish checkout (github.com/publicExcess/splish, a Splash fork tuned for M5 GPUs): the
+    /// `splishDir` setting, else a checkout seen in a LaunchAgent or process, else a usual clone
+    /// location. Run from source, Splish keeps its installs in <checkout>/install/models.
+    static var splishRoot: String? = findSplishRoot(hint: nil)
+
+    static func findSplishRoot(hint: String?) -> String? {
+        let fm = FileManager.default
+        var candidates: [String] = []
+        if let dir = UserDefaults.standard.string(forKey: "splishDir"), !dir.isEmpty { candidates.append(dir) }
+        if let hint { candidates.append(hint) }
+        candidates += ["~/splish", "~/src/splish", "~/Developer/splish", "~/code/splish",
+                       "~/projects/splish", "~/git/splish", "~/GitHub/splish"]
+        // resolved, so it compares equal to the resolved install and assembly paths
+        return candidates.map { (NSString(string: $0).expandingTildeInPath as NSString).resolvingSymlinksInPath }
+            .first { fm.isExecutableFile(atPath: "\($0)/splish") && fm.fileExists(atPath: "\($0)/install/launcher.py") }
+    }
+
+    /// Model stores to scan: Splash's, then the Splish checkout's.
+    static var splashModelRoots: [String] {
+        [splashModelsDir] + (splishRoot.map { ["\($0)/install/models"] } ?? [])
+    }
+
+    /// "Splish" for paths inside the Splish checkout, else "Splash".
+    static func splashEngine(for path: String) -> String {
+        if let root = splishRoot, path.hasPrefix(root + "/") { return "Splish" }
+        return "Splash"
+    }
+
+    /// The engine new Splash models start with: the `splashEngine` setting when Splish is present,
+    /// else whichever is installed (Splash first).
+    var preferredSplashEngine: String {
+        guard AppDelegate.splishRoot != nil else { return "Splash" }
+        if let e = UserDefaults.standard.string(forKey: "splashEngine") { return e == "Splish" ? "Splish" : "Splash" }
+        return FileManager.default.isExecutableFile(atPath: AppDelegate.splashCLI) ? "Splash" : "Splish"
+    }
+
+    /// The engine that serves `id`: the one whose store has it, else the preferred one.
+    func splashEngine(forModel id: String) -> String {
+        guard AppDelegate.splishRoot != nil else { return "Splash" }
+        let inSplish = model.splishInstalled.contains(id), inSplash = model.splashStoreInstalled.contains(id)
+        if inSplish != inSplash { return inSplish ? "Splish" : "Splash" }
+        return preferredSplashEngine
+    }
     /// The panel's own Splash slot. Its plist is rewritten whenever a model is picked in
     /// the panel; it never starts at login and launchd never restarts it.
     static let panelSplashLabel = "\(AppPaths.agentPrefix).splash"
     static let panelSplashPort = 8000
     static let panelSplashLog = "\(AppPaths.logPrefix)-splash.log"
 
-    private typealias SplashProc = (pid: Int, ppid: Int, port: Int, model: String?, serving: Bool)
+    private typealias SplashProc = (pid: Int, ppid: Int, port: Int, model: String?, serving: Bool, engine: String, root: String)
 
     /// LaunchAgents whose program is the `splash` CLI with `serve` become start-able rows.
     private func loadSplashAgents() {
+        AppDelegate.splishRoot = AppDelegate.findSplishRoot(hint: AppDelegate.splishRoot)
         let files = (try? FileManager.default.contentsOfDirectory(atPath: launchAgentsDir)) ?? []
         var agents: [SplashServerState] = []
         for f in files.sorted() where f.hasSuffix(".plist") {
@@ -972,16 +1061,21 @@ final class PressureGraphView: NSView {
                 let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
                 let label = plist["Label"] as? String,
                 let args = plist["ProgramArguments"] as? [String],
-                let exe = args.first, (exe as NSString).lastPathComponent == "splash",
+                let exe = args.first, ["splash", "splish"].contains((exe as NSString).lastPathComponent),
                 args.contains("serve")
             else { continue }
+            let isSplish = (exe as NSString).lastPathComponent == "splish"
+            if isSplish, AppDelegate.splishRoot == nil {
+                AppDelegate.splishRoot = AppDelegate.findSplishRoot(hint: (exe as NSString).deletingLastPathComponent)
+            }
             func arg(_ flag: String) -> String? {
                 args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
             }
             agents.append(SplashServerState(
                 port: arg("--port").flatMap(Int.init) ?? 8000, label: label,
                 agentModel: arg("--model"),
-                logPath: plist["StandardOutPath"] as? String))
+                logPath: plist["StandardOutPath"] as? String,
+                engine: isSplish ? "Splish" : "Splash"))
         }
         // keep live state of rows that survive the reload
         let previous = model.splashServers
@@ -991,6 +1085,7 @@ final class PressureGraphView: NSView {
             old.agentModel = a.agentModel
             old.port = a.port
             old.logPath = a.logPath
+            old.engine = a.engine
             return old
         } + previous.filter { !$0.configured }
         loadSplashInstalled()
@@ -1001,6 +1096,7 @@ final class PressureGraphView: NSView {
     func loadSplashInstalled() {
         var names = Set<String>()
         var languageOnly = Set<String>()
+        var splish = Set<String>(), splash = Set<String>()
         var seen = Set<String>()
         for link in LibraryScanner.splashLinks() {
             let assembly = (link as NSString).resolvingSymlinksInPath
@@ -1008,9 +1104,12 @@ final class PressureGraphView: NSView {
                   let record = LibraryScanner.readJSON("\(assembly)/model.json"),
                   let id = record["model"] as? String else { continue }
             names.insert(id)
+            if AppDelegate.splashEngine(for: assembly) == "Splish" { splish.insert(id) } else { splash.insert(id) }
             if record["vision_format"] as? String == "none" { languageOnly.insert(id) }
         }
         model.splashInstalled = names.sorted()
+        model.splishInstalled = splish
+        model.splashStoreInstalled = splash
         model.splashLanguageOnly = languageOnly
     }
 
@@ -1032,9 +1131,10 @@ final class PressureGraphView: NSView {
     }
 
     /// `splash serve` runs install/launcher.py (download/hash), which then becomes
-    /// server/server.py; the engine is a child of server.py.
+    /// server/server.py; the engine is a child of server.py. A Splish checkout runs the same
+    /// two scripts from its own folder.
     private static func findSplashProcesses() -> [SplashProc] {
-        let out = shell("ps -axo pid=,ppid=,command= | grep -E 'splash[^ ]*/(server/server\\.py|install/launcher\\.py serve)' | grep -v grep")
+        let out = shell("ps -axo pid=,ppid=,command= | grep -E '/(server/server\\.py|install/launcher\\.py serve)' | grep -v grep")
         var procs: [SplashProc] = []
         for line in out.split(separator: "\n") {
             let parts = line.trimmingCharacters(in: .whitespaces).split(separator: " ", maxSplits: 2,
@@ -1045,8 +1145,16 @@ final class PressureGraphView: NSView {
                 guard let r = cmd.range(of: pattern, options: .regularExpression) else { return nil }
                 return cmd[r].split(separator: " ").last.map(String.init)
             }
+            // the checkout the scripts run from; only Splash-shaped folders count
+            guard let script = cmd.split(separator: " ").first(where: {
+                $0.hasSuffix("/server/server.py") || $0.hasSuffix("/install/launcher.py")
+            }) else { continue }
+            let root = ((String(script) as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
+            guard FileManager.default.fileExists(atPath: "\(root)/install/launcher.py") else { continue }
+            let splish = FileManager.default.isExecutableFile(atPath: "\(root)/splish")
             procs.append((pid, ppid, capture("--port [0-9]+").flatMap(Int.init) ?? 8000,
-                          capture("--model [^ ]+"), cmd.contains("server/server.py")))
+                          capture("--model [^ ]+"), cmd.contains("server/server.py"),
+                          splish ? "Splish" : "Splash", root))
         }
         // a launcher that forked its server would show up twice — keep the server
         return procs.filter { p in !procs.contains { $0.ppid == p.pid && $0.serving } }
@@ -1081,7 +1189,14 @@ final class PressureGraphView: NSView {
             if model.splashServers[i].pid != pid { model.splashServers[i].ready = false }
             model.splashServers[i].running = true
             model.splashServers[i].pid = pid
-            if let proc { model.splashServers[i].port = proc.port }
+            if let proc {
+                model.splashServers[i].port = proc.port
+                model.splashServers[i].engine = proc.engine
+                if proc.engine == "Splish", AppDelegate.splishRoot == nil {
+                    AppDelegate.splishRoot = AppDelegate.findSplishRoot(hint: proc.root)
+                    loadSplashInstalled()
+                }
+            }
             if model.splashServers[i].model == nil { model.splashServers[i].model = proc?.model }
         }
         // agents: launchd knows their pid; the server may be that pid or its child
@@ -1093,7 +1208,7 @@ final class PressureGraphView: NSView {
                 if let proc { claimed.insert(proc.pid) }
             } else {
                 model.splashServers[i] = SplashServerState(port: s.port, label: s.label,
-                                                           agentModel: s.agentModel, logPath: s.logPath)
+                                                           agentModel: s.agentModel, logPath: s.logPath, engine: s.engine)
             }
         }
         // everything else is an ad-hoc `splash serve`
@@ -1103,7 +1218,8 @@ final class PressureGraphView: NSView {
             if let i = model.splashServers.firstIndex(where: { !$0.configured && $0.pid == p.pid }) {
                 markRunning(i, pid: p.pid, proc: p)
             } else {
-                model.splashServers.append(SplashServerState(port: p.port, running: true, pid: p.pid, model: p.model))
+                model.splashServers.append(SplashServerState(port: p.port, running: true, pid: p.pid, model: p.model,
+                                                             engine: p.engine))
             }
         }
         // running first, then the panel slot, then other agents by label
@@ -1203,19 +1319,20 @@ final class PressureGraphView: NSView {
     /// Point the panel's Splash slot at `modelID` ("org/repo:VARIANT") and start it.
     /// Splash downloads and verifies the model itself on first use.
     func serveInSplash(_ modelID: String, languageOnly: Bool = false) {
+        let engine = splashEngine(forModel: modelID)
         notePanelIntent(.splash, modelID)
         for s in model.splashServers where s.running && s.port == AppDelegate.panelSplashPort { notePanelIntent(.splash, s.model) }
         model.hfJob = HFJob(target: .splash, model: modelID, status: "Stopping the server on :\(AppDelegate.panelSplashPort)…")
         pushUpdate()
         freeSplashPort(AppDelegate.panelSplashPort, except: nil) { [weak self] in
             guard let self else { return }
-            self.writePanelSplashAgent(model: modelID, languageOnly: languageOnly)
+            self.writePanelSplashAgent(model: modelID, languageOnly: languageOnly, engine: engine)
             let domain = "gui/\(getuid())"
             _ = AppDelegate.launchctl(["bootout", "\(domain)/\(AppDelegate.panelSplashLabel)"])
             _ = AppDelegate.launchctl(["bootstrap", domain, self.panelSplashPlistPath])
             self.loadSplashAgents()
             self.launchAgent(AppDelegate.panelSplashLabel)
-            self.model.hfJob?.status = "Starting Splash…"
+            self.model.hfJob?.status = "Starting \(engine)…"
             self.model.hfJob?.started = Date()
             self.pushUpdate()
         }
@@ -1225,16 +1342,18 @@ final class PressureGraphView: NSView {
         (launchAgentsDir as NSString).appendingPathComponent("\(AppDelegate.panelSplashLabel).plist")
     }
 
-    private func writePanelSplashAgent(model modelID: String, languageOnly: Bool) {
+    private func writePanelSplashAgent(model modelID: String, languageOnly: Bool, engine: String) {
         let home = NSHomeDirectory()
+        let cli = engine == "Splish" ? AppDelegate.splishRoot.map { "\($0)/splish" } ?? AppDelegate.splashCLI
+                                     : AppDelegate.splashCLI
         let plist: [String: Any] = [
             "Label": AppDelegate.panelSplashLabel,
-            "ProgramArguments": [AppDelegate.splashCLI, "serve", "--model", modelID]
+            "ProgramArguments": [cli, "serve", "--model", modelID]
                 + (languageOnly ? ["--language-only"] : [])
                 + ["--host", "127.0.0.1", "--port", "\(AppDelegate.panelSplashPort)"],
             "RunAtLoad": false,
             "KeepAlive": false,
-            "EnvironmentVariables": ["PATH": "\(home)/.local/bin:/opt/homebrew/bin:/usr/bin:/bin"],
+            "EnvironmentVariables": ["PATH": "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"],
             "StandardOutPath": AppDelegate.panelSplashLog,
             "StandardErrorPath": AppDelegate.panelSplashLog,
         ]
@@ -1936,8 +2055,11 @@ struct LibraryInstance {
     var links: [String] = []           // Splash: install links pointing at the assembly
     var sourceRepos: [String] = []     // Splash: target + draft repos it pins
     var languageOnly = false           // Splash: installed without the vision tower
+    var engine: String? = nil          // Splash: "Splish" when installed in a Splish checkout
 
-    var id: String { "\(backend.rawValue)|\(ref)" }
+    var id: String { "\(backend.rawValue)\(engine.map { "-" + $0.lowercased() } ?? "")|\(ref)" }
+    /// Where this copy lives, as the user knows it ("Splish" rather than "Splash" for a checkout).
+    var place: String { engine ?? backend.title }
 }
 
 /// A model as the user thinks of it: the same weights, wherever they are installed.
@@ -2050,8 +2172,8 @@ enum LibraryScanner {
     /// Splash install links: models/<org>/<repo:VARIANT> and .selections/<hash>.
     static func splashLinks() -> [String] {
         let fm = FileManager.default
-        let dir = AppDelegate.splashModelsDir
         var links: [String] = []
+        for dir in AppDelegate.splashModelRoots {
         for org in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] where !org.hasPrefix(".") || org == ".selections" {
             let orgDir = "\(dir)/\(org)"
             for name in (try? fm.contentsOfDirectory(atPath: orgDir)) ?? [] where !name.hasPrefix(".") {
@@ -2060,6 +2182,7 @@ enum LibraryScanner {
                     links.append(link)
                 }
             }
+        }
         }
         return links
     }
@@ -2158,7 +2281,8 @@ enum LibraryScanner {
             add(id.lowercased(), name: shortModelName(id), repo: target, LibraryInstance(
                 backend: .splash, ref: id, repo: target, repoDir: target.map(repoDir), weightsBytes: weights,
                 files: files, assembly: assembly, links: links.sorted(), sourceRepos: repos,
-                languageOnly: record["vision_format"] as? String == "none"))
+                languageOnly: record["vision_format"] as? String == "none",
+                engine: AppDelegate.splashEngine(for: assembly) == "Splish" ? "Splish" : nil))
         }
 
         // 2. HF cache: GGUF quants not installed in Splash, and MLX conversions
@@ -2333,7 +2457,8 @@ enum LibraryScanner {
     /// Unlink a Splash install, drop its pins and its assembly. Runs under Splash's install lock.
     static func removeSplashInstall(_ inst: LibraryInstance) throws {
         let fm = FileManager.default
-        let dir = AppDelegate.splashModelsDir
+        let place = inst.assembly ?? inst.links.first ?? ""
+        let dir = AppDelegate.splashModelRoots.first { place.hasPrefix($0 + "/") } ?? AppDelegate.splashModelsDir
         let lockPath = "\(dir)/.install.lock"
         let fd = open(lockPath, O_RDWR | O_CREAT, 0o644)
         guard fd >= 0 else { throw DeleteError.failed("Couldn't open Splash's install lock") }
@@ -2429,7 +2554,11 @@ final class LibraryStore {
         if changed { save() }
     }
 
+    /// Debug windows (`--window`) look but don't touch: no favorites, stats or history are written.
+    static let readOnly = CommandLine.arguments.contains("--window")
+
     func save() {
+        guard !LibraryStore.readOnly else { return }
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .iso8601
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -2439,6 +2568,7 @@ final class LibraryStore {
     }
 
     func log(_ event: String, _ fields: [String: Any]) {
+        guard !LibraryStore.readOnly else { return }
         var obj = fields
         obj["ev"] = event
         obj["t"] = ISO8601DateFormatter().string(from: Date())
@@ -3126,7 +3256,7 @@ private final class ModelRowView: HoverRowView {
 
 }
 
-final class PanelContentView: NSView, NSSearchFieldDelegate {
+final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
     private let model: PanelModel
     private weak var appDelegate: AppDelegate?
 
@@ -3156,6 +3286,8 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
     private var hfMetaLabel: NSTextField!
     private var hfBody: NSStackView!
     private var hfSearch: NSSearchField!
+    /// Debug screenshots: show the query a `--hf-search` run searched for.
+    func showSearchQuery(_ query: String) { hfSearch.stringValue = query }
     private var hfRecent: NSButton!
     private var hfStatusLabel: NSTextField!
     private var hfRepoRow: NSView!
@@ -3538,6 +3670,16 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
             item.target = self
             more.menu?.addItem(item)
         }
+        // shown only when a Splish checkout is found (menuNeedsUpdate)
+        more.menu?.addItem(.separator())
+        for engine in ["Splash", "Splish"] {
+            let item = NSMenuItem(title: "Run Splash models with \(engine)", action: #selector(menuSplashEngine(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = engine
+            item.tag = 7
+            more.menu?.addItem(item)
+        }
+        more.menu?.delegate = self
         more.menu?.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Local AI Manager", action: #selector(menuQuit), keyEquivalent: "q")
         quit.target = self
@@ -3547,6 +3689,20 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
     }
 
     @objc private func menuRefresh() { refreshNow() }
+    @objc private func menuSplashEngine(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(sender.representedObject as? String, forKey: "splashEngine")
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        let hasSplish = AppDelegate.splishRoot != nil
+        let current = appDelegate?.preferredSplashEngine
+        for item in menu.items where item.tag == 7 {
+            item.isHidden = !hasSplish
+            item.state = (item.representedObject as? String) == current ? .on : .off
+        }
+        // the separator before the engine items goes with them
+        if let i = menu.items.firstIndex(where: { $0.tag == 7 }), i > 0 { menu.items[i - 1].isHidden = !hasSplish }
+    }
     @objc private func menuQuit() { NSApp.terminate(nil) }
     @objc private func menuActivityMonitor() {
         NSWorkspace.shared.openApplication(
@@ -3940,7 +4096,7 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
         // Ollama always shows (its placeholder says how to start it); MLX and Splash only when present.
         let showMlx = !model.mlxServers.isEmpty || !model.mlxCached.isEmpty || appDelegate?.hasMlxEnv == true
         let showSplash = !model.splashServers.isEmpty || !model.splashInstalled.isEmpty
-            || FileManager.default.isExecutableFile(atPath: AppDelegate.splashCLI)
+            || FileManager.default.isExecutableFile(atPath: AppDelegate.splashCLI) || AppDelegate.splishRoot != nil
         sectionViews["MLX SERVERS"]?.forEach { $0.isHidden = !showMlx }
         sectionViews["SPLASH"]?.forEach { $0.isHidden = !showSplash }
         let allSpecs = recentSpecs + ollamaSpecs + mlxSpecs + splashSpecs
@@ -4031,7 +4187,7 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
                 name: it.name, detail: detail,
                 action: RowAction(title: "Load", tooltip: "Load in \(PanelContentView.loadTitle(inst))",
                                   run: { [weak app] in app?.loadInstance(inst) }),
-                info: "\(it.name)\n\(inst.backend.title): \(inst.ref)" + (it.favorite ? "\n★ Favorite" : ""))))
+                info: "\(it.name)\n\(inst.place): \(inst.ref)" + (it.favorite ? "\n★ Favorite" : ""))))
         }
     }
 
@@ -4253,7 +4409,7 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
         ]))
         name.maximumNumberOfLines = 1
         name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        var tip = [m.name] + m.instances.map { "\($0.backend.title): \($0.ref)" }
+        var tip = [m.name] + m.instances.map { "\($0.place): \($0.ref)" }
         if let st, st.loadCount > 0 || st.secondsLoaded > 0 {
             tip.append(String(format: "Loaded %d× · %.1f h in memory · peak %.1f GB", st.loadCount, st.secondsLoaded / 3600, st.peakGB))
         }
@@ -4355,7 +4511,7 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
         }
         menu.addItem(.separator())
         for i in m.instances {
-            let title = "Delete from \(i.backend.title)" + (i.backend == .ollama && ollamaCount > 1 ? " — \(i.ref)" : "") + "…"
+            let title = "Delete from \(i.place)" + (i.backend == .ollama && ollamaCount > 1 ? " — \(i.ref)" : "") + "…"
             menu.addItem(menuItem(title) { [weak self] in self?.askDelete(m, [i]) })
         }
         if m.instances.count > 1 {
@@ -4385,10 +4541,10 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
         row.layer?.borderColor = NSColor.systemRed.withAlphaComponent(0.35).cgColor
 
         let what = everywhere ? "Delete everywhere"
-            : "Delete from \(targets.first?.backend.title ?? "?")"
+            : "Delete from \(targets.first?.place ?? "?")"
         let title = uiLabel("\(what) — frees \(PanelContentView.formatBytes(freed))", 12, .semibold)
         title.lineBreakMode = .byTruncatingTail
-        title.toolTip = m.name + "\n" + targets.map { "\($0.backend.title): \($0.ref)" }.joined(separator: "\n")
+        title.toolTip = m.name + "\n" + targets.map { "\($0.place): \($0.ref)" }.joined(separator: "\n")
 
         var note: String
         var noteColor = NSColor.secondaryLabelColor
@@ -4595,7 +4751,8 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
             if let pid = srv.pid { info.append("pid \(pid)") }
             if let ctx = srv.contextTokens { info.append("context \(AppDelegate.formatTokens(ctx))") }
             if srv.peakGB > 0 { info.append(String(format: "peak %.1f GB", srv.peakGB)) }
-            info.append(srv.label.map { "LaunchAgent \($0)" } ?? "started by hand (splash serve)")
+            info.append(srv.label.map { "LaunchAgent \($0)" } ?? "started by hand (\(srv.engine.lowercased()) serve)")
+            if srv.engine == "Splish" { info.append("engine: Splish (M5-tuned Splash fork)") }
             if let agent = srv.agentModel, srv.running, agent != srv.displayName {
                 info.append("agent model: \(agent)")
             }
@@ -4613,7 +4770,8 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
                     info: info.joined(separator: "\n")))))
                 continue
             }
-            let detail = srv.ready ? (srv.busy ? "Busy" : "") : (srv.lastLog.map { _ in "Starting…" } ?? "Starting…")
+            let detail = srv.ready ? (srv.busy ? "Busy" : (srv.engine == "Splish" ? "Splish" : ""))
+                                   : (srv.lastLog.map { _ in "Starting…" } ?? "Starting…")
             specs.append(RowSpec(key: "splash:\(srv.id):\(srv.ready ? "up" : "starting")", kind: .model(ModelRow(
                 dot: srv.ready ? .systemTeal : .systemOrange, pulse: !srv.ready,
                 name: srv.shortName, port: srv.port,
@@ -4628,7 +4786,8 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
             let star = { app.isFavorite(.splash, $0) }
             specs.append(RowSpec(key: "splash-load|\(loadable.map { (star($0) ? "*" : "") + $0 }.joined(separator: "|"))", kind: .load(
                 names: loadable,
-                tooltip: "Serve on :\(AppDelegate.panelSplashPort) — replaces the model running there",
+                tooltip: "Serve on :\(AppDelegate.panelSplashPort) — replaces the model running there"
+                    + (AppDelegate.splishRoot != nil ? " (with \(app.preferredSplashEngine) unless installed in only one)" : ""),
                 star: star,
                 pick: { [weak self] in self?.appDelegate?.loadSplashModel($0) })))
         }
