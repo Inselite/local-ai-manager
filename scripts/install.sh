@@ -40,5 +40,10 @@ cat > "$PLIST" <<PLIST
 </plist>
 PLIST
 
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+# The old copy can take a moment to stop; retry until launchd accepts the new one.
+for _ in 1 2 3 4 5; do
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && break
+    sleep 1
+done
+launchctl print "gui/$(id -u)/$LABEL" >/dev/null
 echo "Installed $DEST — look for the memory-chip icon in the menu bar."

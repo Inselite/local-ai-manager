@@ -35,6 +35,8 @@ A history of loads, unloads, downloads and deletes is kept locally.
   - [Splash](https://github.com/incoai/splash): the `splash` CLI in `~/.local/bin` or Homebrew.
   - MLX: a Python environment with `mlx-lm` (optionally `mlx-vlm`) and `huggingface_hub`. See [MLX setup](#mlx-setup).
 
+  The MLX and Splash sections only appear when that backend is installed.
+
 ## Install
 
 ```sh

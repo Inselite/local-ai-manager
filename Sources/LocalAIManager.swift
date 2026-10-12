@@ -1565,6 +1565,8 @@ final class PressureGraphView: NSView {
                                              "~/mlx/bin/mlx_lm.server", "~/.local/pipx/venvs/mlx-lm/bin/mlx_lm.server"])
         return found.map { ($0 as NSString).deletingLastPathComponent } ?? NSString(string: "~/.venv-mlx/bin").expandingTildeInPath
     }
+    /// Whether an MLX Python environment was found (the MLX section hides without one).
+    var hasMlxEnv: Bool { FileManager.default.isExecutableFile(atPath: "\(mlxBinDir)/python") }
     static let panelMlxPort = 8081
     static let hfHubDir = NSString(string: "~/.cache/huggingface/hub").expandingTildeInPath
     private var mlxDownload: Process?
@@ -3144,6 +3146,8 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
     private var ollamaRows: NSStackView!
     private var mlxRows: NSStackView!
     private var splashRows: NSStackView!
+    /// Hairline, header and rows of each backend section, hidden when that backend isn't installed.
+    private var sectionViews: [String: [NSView]] = [:]
     private var rootStack: NSStackView!
     /// Popover height that fits the current rows (16 top + 12 bottom around the root stack).
     private(set) var fittedHeight: CGFloat = 600
@@ -3482,11 +3486,13 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
         }
 
         for (title, accessory) in [("OLLAMA", ejectAllButton as NSView?), ("MLX SERVERS", nil), ("SPLASH", nil)] {
-            addFull(hairline(), to: run, after: 10)
+            let line = hairline()
+            addFull(line, to: run, after: 10)
             let (header, meta) = makeSectionHeader(title, accessory: accessory)
             addFull(header, to: run, after: 6)
             let rows = makeRowStack()
             addFull(rows, to: run, after: 10)
+            sectionViews[title] = [line, header, rows]
             switch title {
             case "OLLAMA": ollamaMetaLabel = meta; ollamaRows = rows
             case "MLX SERVERS": mlxMetaLabel = meta; mlxRows = rows
@@ -3931,6 +3937,12 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
         let ollamaSpecs = buildOllamaSpecs()
         let mlxSpecs = buildMlxSpecs()
         let splashSpecs = buildSplashSpecs()
+        // Ollama always shows (its placeholder says how to start it); MLX and Splash only when present.
+        let showMlx = !model.mlxServers.isEmpty || !model.mlxCached.isEmpty || appDelegate?.hasMlxEnv == true
+        let showSplash = !model.splashServers.isEmpty || !model.splashInstalled.isEmpty
+            || FileManager.default.isExecutableFile(atPath: AppDelegate.splashCLI)
+        sectionViews["MLX SERVERS"]?.forEach { $0.isHidden = !showMlx }
+        sectionViews["SPLASH"]?.forEach { $0.isHidden = !showSplash }
         let allSpecs = recentSpecs + ollamaSpecs + mlxSpecs + splashSpecs
         let sig = allSpecs.map(\.sig).joined(separator: "\u{1}")
         if sig != lastRowSig {

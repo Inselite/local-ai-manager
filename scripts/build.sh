@@ -7,5 +7,5 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 swiftc -O -suppress-warnings -target arm64-apple-macos26.0 Sources/LocalAIManager.swift -o "$APP/Contents/MacOS/LocalAIManager"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
-codesign --force --sign - "$APP"
+codesign --force --sign - "$APP" 2>/dev/null
 echo "Built $APP"
