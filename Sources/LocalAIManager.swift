@@ -100,6 +100,7 @@ struct HFRepo {
     let downloads: Int
     let likes: Int
     let createdAt: Date?
+    let format: HFFormat
 }
 
 struct HFQuant {
@@ -167,14 +168,17 @@ final class PanelModel {
     var splishInstalled: Set<String> = []     // installs in the Splish checkout's own store
     var splashStoreInstalled: Set<String> = [] // installs in Splash's store
     var library: LibrarySnapshot?
+    var engines: [EngineKind: EngineState] = [:]
+    var enginesScannedAt: Date?
+    var engineChecking = false
+    var engineJob: EngineJob?
 
-    var hfFormat: HFFormat = HFFormat(rawValue: UserDefaults.standard.string(forKey: "hfFormat") ?? "") ?? .gguf {
-        didSet { UserDefaults.standard.set(hfFormat.rawValue, forKey: "hfFormat") }
-    }
     var hfResults: [HFRepo] = []
     var hfDetail: HFRepoDetail?
     var hfSearching = false
-    var hfError: String?
+    var hfError: String?              // the search failed or found nothing
+    var hfQuery = ""                  // the query hfResults answer
+    var hfDetailError: String?        // the expanded repo couldn't be read
     var hfJob: HFJob?
 
     var history: [RamSample] = []
@@ -259,6 +263,19 @@ enum MemSampler {
 }
 
 // MARK: - Graph view
+
+/// A click anywhere on a view runs a closure.
+final class ClosureClickGesture: NSClickGestureRecognizer {
+    private let run: () -> Void
+    init(_ run: @escaping () -> Void) {
+        self.run = run
+        super.init(target: nil, action: nil)
+        target = self
+        action = #selector(fire)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    @objc private func fire() { run() }
+}
 
 final class ClosureButton: NSButton {
     var onAction: (() -> Void)?
@@ -507,6 +524,8 @@ final class PressureGraphView: NSView {
     var libraryScanInFlight = false
     var libraryRescanQueued = false
     var lastJobLogged = ""
+    var engineScanInFlight = false
+    private weak var debugContent: PanelContentView?   // the `--window` panel, updated like the popover
     let mlxConfigPath = "\(AppPaths.stateDir)/mlx_servers.json"
     let launchAgentsDir = NSString(string: "~/Library/LaunchAgents").expandingTildeInPath
 
@@ -536,9 +555,35 @@ final class PressureGraphView: NSView {
             }
             exit(0)
         }
+        // Debug-only: `--dump-engines` prints what the Engines tab would show, after an update check, and exits.
+        if CommandLine.arguments.contains("--dump-engines") {
+            loadMlxConfig()
+            var found = EngineScanner.scan(splishRoot: AppDelegate.splishRoot, mlxBinDir: mlxBinDir)
+            let latest = EngineScanner.checkLatest(found)
+            found = EngineScanner.scan(splishRoot: AppDelegate.splishRoot, mlxBinDir: mlxBinDir)
+            for k in EngineKind.allCases {
+                guard var st = found[k] else { continue }
+                st.latest = latest.releases[k.rawValue] ?? st.latest
+                st.latestPackages = latest.packages
+                print("\(k.rawValue): installed=\(st.installed) method=\(st.method) version=\(st.version ?? "-") extra=\(st.extra ?? "-")")
+                print("    root=\(st.root ?? "-") size=\(PanelContentView.formatBytes(st.bytes)) trash=\(st.trash)")
+                print("    latest=\(st.latest ?? "-") behind=\(st.behind) packages=\(st.packages) update=\(st.updateText ?? "none")")
+            }
+            // dry run: what removing Splash or Splish would delete from the prepared-weights cache
+            let gb = { (e: [LibraryScanner.PreparedEntry]) in String(format: "%d entries, %.1f GB", e.count, e.reduce(0) { $0 + $1.bytes } / 1_073_741_824) }
+            print("prepared cache: \(gb(LibraryScanner.preparedEntries()))")
+            print("remove Splash would delete: \(gb(LibraryScanner.preparedGoing(with: AppDelegate.splashModelsDir, lastEngine: AppDelegate.splishRoot == nil)))")
+            if let root = AppDelegate.splishRoot {
+                print("remove Splish would delete: \(gb(LibraryScanner.preparedGoing(with: "\(root)/install/models", lastEngine: !FileManager.default.isExecutableFile(atPath: AppDelegate.splashCLI))))")
+            }
+            exit(0)
+        }
         loadMlxConfig()
         loadSplashAgents()
         rescanLibrary()
+        rescanEngines { [weak self] in
+            if self?.enginesStale(hours: 12) == true { self?.checkEngineUpdates() }
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "memorychip", accessibilityDescription: "Local AI Manager")
@@ -582,6 +627,8 @@ final class PressureGraphView: NSView {
             guard let self else { return }
             self.refreshLight()
             if self.tickCount % 2 == 1 { self.refreshOllama(); self.refreshMlx(); self.refreshSplash() }
+            // hourly: look for engine updates once the last check is half a day old
+            if self.tickCount % 1800 == 1799, self.enginesStale(hours: 12) { self.checkEngineUpdates() }
             self.tickCount += 1
         }
 
@@ -725,6 +772,7 @@ final class PressureGraphView: NSView {
         win.title = "Local AI Manager"
         win.isReleasedWhenClosed = false
         let content = PanelContentView(model: model, appDelegate: self)
+        debugContent = content
         win.contentView = content
         // center on the built-in display so screencapture -R can composite it
         if let main = NSScreen.screens.first {
@@ -921,6 +969,7 @@ final class PressureGraphView: NSView {
         trackSessions()
         logJobTransitions()
         contentView?.rebuild()
+        debugContent?.rebuild()
     }
 
     // MARK: Ollama actions
@@ -1426,7 +1475,8 @@ final class PressureGraphView: NSView {
     // MARK: Hugging Face
 
     private let hfBase = "https://huggingface.co/api"
-    private var hfSearchTask: URLSessionDataTask?
+    private var hfSearchTasks: [URLSessionDataTask] = []
+    private var hfPendingQuery = ""
     private var hfDetailID: String?
     private var pullTask: Task<Void, Never>?
 
@@ -1449,67 +1499,87 @@ final class PressureGraphView: NSView {
     /// Text models whose pipeline tag (when set) means a chat/completions server can use them.
     static let textPipelines: Set<String> = ["text-generation", "image-text-to-text", "any-to-any", "text2text-generation"]
 
-    /// GGUF or MLX repos by downloads; `recentOnly` keeps those created in the last 90 days.
+    /// GGUF and MLX repos together, by downloads; `recentOnly` keeps those created in the last 90 days.
+    /// An empty query clears the results. Only the newest query's answer is kept.
     func searchHF(_ query: String, recentOnly: Bool) {
-        hfSearchTask?.cancel()
-        let format = model.hfFormat
+        hfSearchTasks.forEach { $0.cancel() }
+        hfSearchTasks = []
         let q = query.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty, let req = hfRequest("/models", query: [
-            URLQueryItem(name: "search", value: q),
-            URLQueryItem(name: "filter", value: format == .gguf ? "gguf" : "mlx"),
-            URLQueryItem(name: "sort", value: "downloads"),
-            URLQueryItem(name: "direction", value: "-1"),
-            URLQueryItem(name: "limit", value: "60"),
-            URLQueryItem(name: "expand[]", value: "downloads"),
-            URLQueryItem(name: "expand[]", value: "likes"),
-            URLQueryItem(name: "expand[]", value: "createdAt"),
-            URLQueryItem(name: "expand[]", value: "pipeline_tag"),
-        ]) else { return }
+        hfPendingQuery = q
+        guard !q.isEmpty else {
+            model.hfResults = []
+            model.hfQuery = ""
+            model.hfSearching = false
+            model.hfError = nil
+            pushUpdate()
+            return
+        }
         model.hfSearching = true
         model.hfError = nil
         pushUpdate()
-        let task = URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
-            if (err as? URLError)?.code == .cancelled { return }
-            let iso = ISO8601DateFormatter()
-            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            var repos: [HFRepo] = []
-            var error: String?
-            if let arr = data.flatMap({ try? JSONSerialization.jsonObject(with: $0) as? [[String: Any]] }) {
-                repos = arr.compactMap { d in
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var found: [HFRepo] = []
+        var errors: [String] = []
+        for format in [HFFormat.gguf, .mlx] {
+            guard let req = hfRequest("/models", query: [
+                URLQueryItem(name: "search", value: q),
+                URLQueryItem(name: "filter", value: format == .gguf ? "gguf" : "mlx"),
+                URLQueryItem(name: "sort", value: "downloads"),
+                URLQueryItem(name: "direction", value: "-1"),
+                URLQueryItem(name: "limit", value: "60"),
+                URLQueryItem(name: "expand[]", value: "downloads"),
+                URLQueryItem(name: "expand[]", value: "likes"),
+                URLQueryItem(name: "expand[]", value: "createdAt"),
+                URLQueryItem(name: "expand[]", value: "pipeline_tag"),
+            ]) else { continue }
+            group.enter()
+            let task = URLSession.shared.dataTask(with: req) { data, resp, err in
+                defer { group.leave() }
+                if (err as? URLError)?.code == .cancelled { return }
+                let iso = ISO8601DateFormatter()
+                iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                guard let arr = data.flatMap({ try? JSONSerialization.jsonObject(with: $0) as? [[String: Any]] }) else {
+                    let msg = err?.localizedDescription ?? "Hugging Face search failed (HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0))"
+                    lock.withLock { errors.append(msg) }
+                    return
+                }
+                let repos: [HFRepo] = arr.compactMap { d in
                     guard let id = d["id"] as? String else { return nil }
                     if let tag = d["pipeline_tag"] as? String, !AppDelegate.textPipelines.contains(tag) { return nil }
                     return HFRepo(id: id, downloads: d["downloads"] as? Int ?? 0, likes: d["likes"] as? Int ?? 0,
-                                  createdAt: (d["createdAt"] as? String).flatMap(iso.date(from:)))
+                                  createdAt: (d["createdAt"] as? String).flatMap(iso.date(from:)), format: format)
                 }
-            } else {
-                error = err?.localizedDescription ?? "Hugging Face search failed (HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0))"
+                lock.withLock { found += repos }
             }
+            hfSearchTasks.append(task)
+            task.resume()
+        }
+        group.notify(queue: .main) { [weak self] in
+            guard let self, self.hfPendingQuery == q else { return }
+            var repos = found
             if recentOnly {
                 let cutoff = Date().addingTimeInterval(-90 * 86_400)
                 repos = repos.filter { ($0.createdAt ?? .distantPast) >= cutoff }
             }
-            repos = Array(repos.prefix(25))
-            DispatchQueue.main.async {
-                guard let self, self.model.hfFormat == format else { return }
-                self.model.hfSearching = false
-                self.model.hfResults = repos
-                let kind = format.rawValue
-                self.model.hfError = error ?? (repos.isEmpty ? (recentOnly ? "No \(kind) text models from the last 90 days" : "No \(kind) text models found") : nil)
-                self.model.hfDetail = nil
-                self.pushUpdate()
-                if let first = repos.first { self.fetchHFDetail(first.id) }
-            }
+            repos = Array(repos.sorted { $0.downloads > $1.downloads }.prefix(30))
+            self.model.hfSearching = false
+            self.model.hfResults = repos
+            self.model.hfQuery = q
+            self.model.hfError = repos.isEmpty
+                ? (errors.first ?? (recentOnly ? "No GGUF or MLX text models from the last 90 days" : "No GGUF or MLX text models found"))
+                : nil
+            self.pushUpdate()
         }
-        hfSearchTask = task
-        task.resume()
     }
 
     /// Architecture/context from the repo's GGUF metadata, quants from its file tree.
-    func fetchHFDetail(_ id: String) {
+    func fetchHFDetail(_ id: String, format: HFFormat) {
         hfDetailID = id
         model.hfDetail = nil
+        model.hfDetailError = nil
         pushUpdate()
-        if model.hfFormat == .mlx { fetchMlxDetail(id); return }
+        if format == .mlx { fetchMlxDetail(id); return }
         guard let infoReq = hfRequest("/models/\(id)", query: [URLQueryItem(name: "expand[]", value: "gguf")]),
               let treeReq = hfRequest("/models/\(id)/tree/main", query: [URLQueryItem(name: "recursive", value: "true")])
         else { return }
@@ -1535,11 +1605,7 @@ final class PressureGraphView: NSView {
                 id: id, architecture: arch,
                 contextTokens: (gguf?["context_length"] as? NSNumber)?.intValue,
                 quants: AppDelegate.quants(from: files))
-            if self.model.hfDetail?.quants.isEmpty == true {
-                self.model.hfError = "No GGUF weight files in \(id)"
-            } else {
-                self.model.hfError = nil
-            }
+            self.model.hfDetailError = self.model.hfDetail?.quants.isEmpty == true ? "No GGUF weight files in \(id)" : nil
             self.pushUpdate()
         }
     }
@@ -1577,7 +1643,7 @@ final class PressureGraphView: NSView {
             group.leave()
         }.resume()
         group.notify(queue: .main) { [weak self] in
-            guard let self, self.hfDetailID == id, self.model.hfFormat == .mlx else { return }
+            guard let self, self.hfDetailID == id else { return }
             let text = cfg?["text_config"] as? [String: Any]
             let ctx = (text?["max_position_embeddings"] ?? cfg?["max_position_embeddings"]) as? NSNumber
             let quant = (cfg?["quantization"] ?? cfg?["quantization_config"]) as? [String: Any]
@@ -1597,7 +1663,7 @@ final class PressureGraphView: NSView {
                 id: id, architecture: cfg?["model_type"] as? String, contextTokens: ctx?.intValue,
                 quants: bytes > 0 ? [HFQuant(tag: tag, sizeGB: bytes / 1_073_741_824.0)] : [],
                 format: .mlx, vision: cfg?["vision_config"] != nil)
-            self.model.hfError = bytes > 0 ? nil
+            self.model.hfDetailError = bytes > 0 ? nil
                 : (cfg == nil ? "Couldn't read \(id) — gated repos need `hf auth login`" : "No .safetensors weights in \(id)")
             self.pushUpdate()
         }
@@ -2204,24 +2270,113 @@ enum LibraryScanner {
         }
     }
 
-    /// Splash's prepared copies of model weights (one folder per tensor group), keyed by the
-    /// assembly folder they were prepared from. Not removed by Splash's own garbage collection.
+    /// Splash's prepared copies of model weights (one folder per tensor group). Splash and Splish
+    /// share this cache. Not removed by Splash's own garbage collection.
     static let splashWeightCache = NSString(string: "~/Library/Caches/Splash/weights").expandingTildeInPath
 
-    static func splashPreparedWeights() -> [String: [String: Double]] {
+    /// One prepared entry. The engine finds entries by the content they were prepared from, so an
+    /// install reuses an entry another install (or the other engine) prepared from the same files;
+    /// `source` only names the install that prepared it first.
+    struct PreparedEntry {
+        let dir: String
+        let group: String          // component + inputs: the same tensors, possibly prepared again in another format
+        let source: String         // <assembly>/target/x.gguf or <assembly>/draft
+        let blobs: Set<String>     // the model files it was prepared from
+        let bytes: Double
+    }
+
+    /// Entry → model files, remembered for entries whose install is gone but whose weights another install still uses.
+    static let preparedSourcesPath = "\(AppPaths.stateDir)/prepared-sources.json"
+
+    static func preparedEntries() -> [PreparedEntry] {
         let fm = FileManager.default
-        var byAssembly: [String: [String: Double]] = [:]
-        for entry in (try? fm.contentsOfDirectory(atPath: splashWeightCache)) ?? [] {
-            let dir = "\(splashWeightCache)/\(entry)"
-            guard let text = try? String(contentsOfFile: "\(dir)/source", encoding: .utf8),
-                  let line = text.split(separator: "\n").first(where: { $0.hasPrefix("source ") }),
-                  let range = line.range(of: "/.resolved/") else { continue }
-            let rest = line[range.upperBound...]
-            let assembly = String(line.dropFirst(7)[..<range.lowerBound]) + "/.resolved/"
-                + String(rest.prefix { $0 != "/" })
-            byAssembly[assembly, default: [:]]["\(dir)/weights"] = fileSize("\(dir)/weights")
+        let known = readJSON(preparedSourcesPath) as? [String: [String]] ?? [:]
+        var remembered: [String: [String]] = [:]
+        var out: [PreparedEntry] = []
+        for name in (try? fm.contentsOfDirectory(atPath: splashWeightCache)) ?? [] {
+            let dir = "\(splashWeightCache)/\(name)"
+            guard let text = try? String(contentsOfFile: "\(dir)/source", encoding: .utf8) else { continue }
+            var fields: [String: String] = [:]
+            for line in text.split(separator: "\n") {
+                guard let sp = line.firstIndex(of: " ") else { continue }
+                fields[String(line[..<sp])] = String(line[line.index(after: sp)...])
+            }
+            // entries of earlier versions hold just the source path on their first line
+            guard let source = fields["source"] ?? text.split(separator: "\n").first.map(String.init).flatMap({ $0.hasPrefix("/") ? $0 : nil })
+            else { continue }
+            var blobs = Set<String>()
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: source, isDirectory: &isDir) {
+                let files = isDir.boolValue
+                    ? ((try? fm.contentsOfDirectory(atPath: source)) ?? []).map { "\(source)/\($0)" } : [source]
+                for f in files where f.hasSuffix(".gguf") || f.hasSuffix(".safetensors") {
+                    blobs.insert((f as NSString).resolvingSymlinksInPath)
+                }
+            } else if let paths = known[name] {
+                blobs = Set(paths.filter { fm.fileExists(atPath: $0) })
+            }
+            if !blobs.isEmpty { remembered[name] = blobs.sorted() }
+            let group = fields["component"].map { "\($0)|\(fields["inputs"] ?? "")" } ?? source
+            out.append(PreparedEntry(dir: dir, group: group, source: source, blobs: blobs, bytes: fileSize("\(dir)/weights")))
         }
-        return byAssembly
+        if remembered != known, !LibraryStore.readOnly, !CommandLine.arguments.contains("--dump-library"),
+           let data = try? JSONSerialization.data(withJSONObject: remembered, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) {
+            try? data.write(to: URL(fileURLWithPath: preparedSourcesPath))
+        }
+        return out
+    }
+
+    /// Every Splash and Splish install (resolved assembly folder) with the model files it links.
+    static func assemblyBlobs() -> [String: Set<String>] {
+        let hub = AppDelegate.hfHubDir
+        var out: [String: Set<String>] = [:]
+        for link in splashLinks() {
+            let assembly = (link as NSString).resolvingSymlinksInPath
+            guard out[assembly] == nil, let record = readJSON("\(assembly)/model.json") else { continue }
+            var blobs = Set<String>()
+            for entry in (record["files"] as? [String: Any] ?? [:]).values {
+                guard let path = (entry as? [String: Any])?["path"] as? String, path.hasPrefix(hub + "/") else { continue }
+                blobs.insert((path as NSString).resolvingSymlinksInPath)
+            }
+            out[assembly] = blobs
+        }
+        return out
+    }
+
+    /// Prepared weights each install uses (assembly → weights file → bytes): those it prepared, and
+    /// those another install prepared from the same files, unless it prepared its own copy of them.
+    static func preparedUsage(_ entries: [PreparedEntry], assemblies: [String: Set<String>]) -> [String: [String: Double]] {
+        func owner(_ e: PreparedEntry) -> String? { assemblies.keys.first { e.source.hasPrefix($0 + "/") } }
+        var ownGroups: [String: Set<String>] = [:]
+        for e in entries { if let a = owner(e) { ownGroups[a, default: []].insert(e.group) } }
+        var usage: [String: [String: Double]] = [:]
+        for e in entries {
+            let prepared = owner(e)
+            for (a, blobs) in assemblies {
+                let reused = !e.blobs.isEmpty && e.blobs.isSubset(of: blobs) && !(ownGroups[a]?.contains(e.group) ?? false)
+                if prepared == a || reused { usage[a, default: [:]]["\(e.dir)/weights"] = e.bytes }
+            }
+        }
+        return usage
+    }
+
+    /// Delete prepared entries no install in `assemblies` uses. Returns the bytes removed.
+    @discardableResult
+    static func removeUnusedPrepared(_ entries: [PreparedEntry], keeping assemblies: [String: Set<String>]) -> Double {
+        let used = Set(preparedUsage(entries, assemblies: assemblies).values.flatMap(\.keys))
+        var freed = 0.0
+        for e in entries where !used.contains("\(e.dir)/weights") && e.dir.hasPrefix(splashWeightCache + "/") {
+            removePreparedEntry(e.dir)
+            freed += e.bytes
+        }
+        return freed
+    }
+
+    /// The entry's files are read-only; the folder is ours to remove.
+    static func removePreparedEntry(_ dir: String) {
+        let fm = FileManager.default
+        for f in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] { chmod("\(dir)/\(f)", 0o600) }
+        try? fm.removeItem(atPath: dir)
     }
 
     static func readJSON(_ path: String) -> [String: Any]? {
@@ -2261,7 +2416,7 @@ enum LibraryScanner {
             linksByAssembly[(link as NSString).resolvingSymlinksInPath, default: []].append(link)
         }
         var splashBlobs = Set<String>()
-        let prepared = splashPreparedWeights()
+        let prepared = preparedUsage(preparedEntries(), assemblies: assemblyBlobs())
         for (assembly, links) in linksByAssembly.sorted(by: { $0.key < $1.key }) {
             guard let record = readJSON("\(assembly)/model.json"), let id = record["model"] as? String else { continue }
             var files: [String: Double] = [:]
@@ -2468,6 +2623,12 @@ enum LibraryScanner {
         }
         defer { flock(fd, LOCK_UN) }
 
+        // read while the install is still linked: entries prepared from it may serve another install too
+        let entries = preparedEntries()
+        var others = assemblyBlobs()
+        let mine = inst.assembly.flatMap { preparedUsage(entries, assemblies: others)[$0] }.map { Set($0.keys) } ?? []
+        if let assembly = inst.assembly { others.removeValue(forKey: assembly) }
+
         for link in inst.links where link.hasPrefix(dir + "/") {
             let owner = splashPinOwner(link)
             for repo in inst.sourceRepos {
@@ -2480,19 +2641,16 @@ enum LibraryScanner {
         guard let assembly = inst.assembly, assembly.hasPrefix(dir + "/.resolved/") else { return }
         let metadata = readJSON("\(assembly)/model.json")?["metadata"] as? String
         try? fm.removeItem(atPath: assembly)
-        // Splash's prepared copy of this install's weights (read-only files; the folder is ours to remove)
-        for weights in (splashPreparedWeights()[assembly] ?? [:]).keys {
+        // this install's prepared weights, unless another install (or the other engine) uses them
+        let kept = Set(preparedUsage(entries, assemblies: others).values.flatMap(\.keys))
+        for weights in mine where !kept.contains(weights) {
             let entry = (weights as NSString).deletingLastPathComponent
-            guard entry.hasPrefix(splashWeightCache + "/") else { continue }
-            for f in (try? fm.contentsOfDirectory(atPath: entry)) ?? [] {
-                chmod("\(entry)/\(f)", 0o600)
-            }
-            try? fm.removeItem(atPath: entry)
+            if entry.hasPrefix(splashWeightCache + "/") { removePreparedEntry(entry) }
         }
         if let metadata {
-            let others = ((try? fm.contentsOfDirectory(atPath: "\(dir)/.resolved")) ?? [])
+            let inUse = ((try? fm.contentsOfDirectory(atPath: "\(dir)/.resolved")) ?? [])
                 .compactMap { readJSON("\(dir)/.resolved/\($0)/model.json")?["metadata"] as? String }
-            if !others.contains(metadata) { try? fm.removeItem(atPath: "\(dir)/.metadata/\(metadata)") }
+            if !inUse.contains(metadata) { try? fm.removeItem(atPath: "\(dir)/.metadata/\(metadata)") }
         }
     }
 }
@@ -2968,6 +3126,834 @@ extension AppDelegate {
 }
 
 
+// MARK: - Engines: install, update, remove
+
+enum EngineKind: String, CaseIterable {
+    case ollama = "Ollama", splash = "Splash", splish = "Splish", mlx = "MLX"
+
+    /// Release notes or project page, for the ⋯ menu.
+    var homepage: String {
+        switch self {
+        case .ollama: return "https://github.com/ollama/ollama/releases"
+        case .splash: return "https://github.com/incoai/splash/releases"
+        case .splish: return "https://github.com/publicExcess/splish/commits"
+        case .mlx: return "https://github.com/ml-explore/mlx-lm/releases"
+        }
+    }
+    /// One line for an engine that isn't installed.
+    var blurb: String {
+        switch self {
+        case .ollama: return "Runs GGUF models from its own library"
+        case .splash: return "Inco's engine for Qwen3.8 and Qwen3.6, with DFlash drafts"
+        case .splish: return "Community Splash fork tuned for M5 GPUs · builds from source"
+        case .mlx: return "mlx-lm and mlx-vlm servers in a Python environment"
+        }
+    }
+}
+
+struct EngineState {
+    enum Method { case app, homebrew, release, git, venv, other }
+    let kind: EngineKind
+    var installed = false
+    var method: Method = .other
+    var version: String?                     // Splish: short commit · MLX: mlx-lm
+    var extra: String?                       // Splish: commit date · MLX: the other packages
+    var root: String?                        // shown, and revealed in Finder
+    var trash: [String] = []                 // what Remove moves to the Trash
+    var bytes: Double = 0
+    var behind = 0                           // Splish: commits behind its upstream, as of the last fetch
+    var packages: [String: String] = [:]     // MLX: package → installed version
+    var latest: String?                      // newest release · Splish: upstream commit
+    var latestPackages: [String: String] = [:]
+
+    /// Installed in a way the panel knows how to update and remove.
+    var managed: Bool { installed && method != .other }
+
+    var updateAvailable: Bool {
+        guard managed else { return false }
+        switch kind {
+        case .splish: return behind > 0
+        case .mlx: return !newerPackages.isEmpty
+        default: return latest.flatMap { l in version.map { EngineScanner.isNewer(l, than: $0) } } ?? false
+        }
+    }
+
+    var newerPackages: [String: String] {
+        latestPackages.filter { name, v in packages[name].map { EngineScanner.isNewer(v, than: $0) } ?? false }
+    }
+
+    /// "1.3.1", "3 new commits", "mlx-lm 0.32.0"
+    var updateText: String? {
+        guard updateAvailable else { return nil }
+        switch kind {
+        case .splish: return behind == 1 ? "1 new commit" : "\(behind) new commits"
+        case .mlx:
+            let newer = newerPackages
+            let lead = newer["mlx-lm"].map { ("mlx-lm", $0) } ?? newer.sorted { $0.key < $1.key }.first.map { ($0.key, $0.value) }
+            guard let lead else { return nil }
+            return "\(lead.0) \(lead.1)" + (newer.count > 1 ? " +\(newer.count - 1)" : "")
+        default: return latest
+        }
+    }
+}
+
+/// An install, update or removal in progress (one at a time), shown in the engine's row.
+struct EngineJob {
+    let kind: EngineKind
+    let action: String                       // "Updating", "Installing", "Removing"
+    var step: String
+    var failed = false
+    var error: String?
+}
+
+/// What removing an engine does, worked out before the user confirms.
+struct EngineRemovalPlan {
+    var trash: [String] = []
+    var trashBytes: Double = 0
+    var preparedBytes: Double = 0            // prepared weights no remaining install uses
+    var installs = 0                         // models linked in its own store (the files stay)
+    var switched: [String] = []              // LaunchAgents moved to the other engine
+    var broken: [String] = []                // LaunchAgents that will stop working
+    var notes: [String] = []
+}
+
+enum EngineScanner {
+    static let home = NSHomeDirectory()
+    static let path = "\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    static let ollamaApps = ["/Applications/Ollama.app", "\(NSHomeDirectory())/Applications/Ollama.app"]
+    static let ollamaTeam = "3MU9H2V9Y9"     // Ollama's Developer ID: updates must carry the same signature
+    static var splishInstallDir: String { "\(home)/splish" }
+    static var mlxInstallVenv: String { "\(home)/.venv-mlx" }
+    static var splashDataDir: String { "\(home)/Library/Application Support/Splash" }
+
+    /// A command's trimmed output, or "" when it fails.
+    static func run(_ exe: String, _ args: [String]) -> String {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: exe)
+        task.arguments = args
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = path
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        task.environment = env
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        guard (try? task.run()) != nil else { return "" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else { return "" }
+        return (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        func parts(_ s: String) -> [Int] { s.split { !$0.isNumber }.map { Int($0) ?? 0 } }
+        let x = parts(a), y = parts(b)
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p > q }
+        }
+        return false
+    }
+
+    static func tilde(_ p: String) -> String { p.hasPrefix(home + "/") ? "~" + p.dropFirst(home.count) : p }
+
+    static func diskBytes(_ paths: [String]) -> Double {
+        let paths = paths.filter { FileManager.default.fileExists(atPath: $0) }
+        guard !paths.isEmpty else { return 0 }
+        let total = run("/usr/bin/du", ["-sck"] + paths).split(separator: "\n").last?.split(separator: "\t").first
+        return (total.flatMap { Double($0) } ?? 0) * 1024
+    }
+
+    /// The release folder a `splash` wrapper script runs (…/splash-1.1.0), if it runs one.
+    static func releaseRoot(wrapper: String) -> String? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: wrapper),
+              attrs[.type] as? FileAttributeType == .typeRegular, ((attrs[.size] as? NSNumber)?.intValue ?? 0) < 4096,
+              let text = try? String(contentsOfFile: wrapper, encoding: .utf8),
+              let r = text.range(of: #"[^"'\s]+/install/launcher\.py"#, options: .regularExpression) else { return nil }
+        let root = String(text[r].dropLast("/install/launcher.py".count))
+            .replacingOccurrences(of: "${HOME}", with: home).replacingOccurrences(of: "$HOME", with: home)
+        return FileManager.default.fileExists(atPath: "\(root)/release.json") ? root : nil
+    }
+
+    /// "/opt/homebrew/Cellar/<name>/<version>" for a command Homebrew installed.
+    static func cellar(_ real: String, _ name: String) -> (root: String, version: String)? {
+        guard let r = real.range(of: "/Cellar/\(name)/"),
+              let v = real[r.upperBound...].split(separator: "/").first else { return nil }
+        return (String(real[..<r.upperBound]) + v, String(v))
+    }
+
+    static func scan(splishRoot: String?, mlxBinDir: String) -> [EngineKind: EngineState] {
+        let fm = FileManager.default
+        var out: [EngineKind: EngineState] = [:]
+
+        var o = EngineState(kind: .ollama)
+        if let app = ollamaApps.first(where: { fm.fileExists(atPath: $0) }) {
+            o.installed = true; o.method = .app; o.root = app; o.trash = [app]
+            o.version = NSDictionary(contentsOfFile: "\(app)/Contents/Info.plist")?["CFBundleShortVersionString"] as? String
+        } else if let cli = AppPaths.firstExecutable(["/opt/homebrew/bin/ollama", "/usr/local/bin/ollama"]) {
+            o.installed = true
+            if let c = cellar((cli as NSString).resolvingSymlinksInPath, "ollama") {
+                o.method = .homebrew; o.root = c.root; o.version = c.version
+            } else {
+                o.root = cli
+                o.version = run(cli, ["--version"]).split(separator: " ").last.map(String.init)
+            }
+        }
+        out[.ollama] = o
+
+        var s = EngineState(kind: .splash)
+        let cli = AppDelegate.splashCLI
+        if fm.isExecutableFile(atPath: cli) {
+            s.installed = true
+            if let c = cellar((cli as NSString).resolvingSymlinksInPath, "splash") {
+                s.method = .homebrew; s.root = c.root; s.version = c.version
+            } else if let root = releaseRoot(wrapper: cli) {
+                s.method = .release; s.root = root; s.trash = [root, cli]
+                s.version = LibraryScanner.readJSON("\(root)/release.json")?["version"] as? String
+            } else {
+                s.root = cli
+            }
+            if s.version == nil { s.version = run(cli, ["--version"]).split(separator: " ").last.map(String.init) }
+        }
+        out[.splash] = s
+
+        var p = EngineState(kind: .splish)
+        if let root = splishRoot {
+            p.installed = true; p.method = .git; p.root = root; p.trash = [root]
+            let head = run("/usr/bin/git", ["-C", root, "log", "-1", "--format=%h %cs"]).split(separator: " ")
+            p.version = head.first.map(String.init)
+            p.extra = head.count > 1 ? String(head[1]) : nil
+            p.behind = Int(run("/usr/bin/git", ["-C", root, "rev-list", "--count", "HEAD..@{u}"])) ?? 0
+            let upstream = run("/usr/bin/git", ["-C", root, "rev-parse", "--short", "@{u}"])
+            p.latest = upstream.isEmpty ? nil : upstream
+        }
+        out[.splish] = p
+
+        var m = EngineState(kind: .mlx)
+        let venv = (mlxBinDir as NSString).deletingLastPathComponent
+        if fm.isExecutableFile(atPath: "\(mlxBinDir)/python") {
+            m.installed = true
+            m.root = venv
+            // only a real venv is the panel's to update and remove
+            if fm.fileExists(atPath: "\(venv)/pyvenv.cfg") { m.method = .venv; m.trash = [venv] }
+            // dist-info folders name each package and version without starting Python
+            for lib in (try? fm.contentsOfDirectory(atPath: "\(venv)/lib")) ?? [] where lib.hasPrefix("python") {
+                for d in (try? fm.contentsOfDirectory(atPath: "\(venv)/lib/\(lib)/site-packages")) ?? [] where d.hasSuffix(".dist-info") {
+                    let stem = d.dropLast(".dist-info".count)
+                    guard let dash = stem.lastIndex(of: "-") else { continue }
+                    let name = stem[..<dash].lowercased().replacingOccurrences(of: "_", with: "-")
+                    if ["mlx-lm", "mlx-vlm", "mlx"].contains(name) { m.packages[name] = String(stem[stem.index(after: dash)...]) }
+                }
+            }
+            m.version = m.packages["mlx-lm"] ?? m.packages["mlx-vlm"]
+            m.extra = m.packages.filter { $0.key != "mlx-lm" }.sorted { $0.key < $1.key }
+                .map { "\($0.key) \($0.value)" }.joined(separator: " · ")
+        }
+        out[.mlx] = m
+
+        for (k, st) in out where st.installed {
+            out[k]?.bytes = diskBytes(st.method == .homebrew ? [st.root].compactMap { $0 } : st.trash)
+        }
+        return out
+    }
+
+    static func fetchJSON(_ url: String) -> [String: Any]? {
+        guard let u = URL(string: url) else { return nil }
+        var req = URLRequest(url: u, timeoutInterval: 15)
+        req.setValue("LocalAIManager", forHTTPHeaderField: "User-Agent")
+        var result: [String: Any]?
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            if (resp as? HTTPURLResponse)?.statusCode == 200, let data {
+                result = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            }
+            done.signal()
+        }.resume()
+        done.wait()
+        return result
+    }
+
+    /// Latest release tag on GitHub, without a leading "v".
+    static func latestRelease(_ k: EngineKind) -> String? {
+        let repo: String
+        switch k {
+        case .ollama: repo = "ollama/ollama"
+        case .splash: repo = "incoai/splash"
+        default: return nil
+        }
+        guard let tag = fetchJSON("https://api.github.com/repos/\(repo)/releases/latest")?["tag_name"] as? String else { return nil }
+        return tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+    }
+
+    /// Newest versions upstream (network). Splish fetches its remote; `scan` then counts the new commits.
+    static func checkLatest(_ engines: [EngineKind: EngineState]) -> (releases: [String: String], packages: [String: String]) {
+        var releases: [String: String] = [:]
+        for k in [EngineKind.ollama, .splash] { if let v = latestRelease(k) { releases[k.rawValue] = v } }
+        if let p = engines[.splish], p.installed, let root = p.root {
+            _ = run("/usr/bin/git", ["-C", root, "fetch", "--quiet"])
+        }
+        var packages: [String: String] = [:]
+        for name in engines[.mlx]?.packages.keys.sorted() ?? [] {
+            if let v = (fetchJSON("https://pypi.org/pypi/\(name)/json")?["info"] as? [String: Any])?["version"] as? String {
+                packages[name] = v
+            }
+        }
+        return (releases, packages)
+    }
+}
+
+/// Shell scripts for installs and updates. "==> " lines become the step shown in the engine's row.
+enum EngineScripts {
+    /// $1 version, $2 path of the `splash` command. Unpacks ~/splash-<version> and points the command at it.
+    static let splashRelease = #"""
+    set -eu
+    v="$1"; wrapper="$2"; dest="$HOME/splash-$v"
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    url="https://github.com/incoai/splash/releases/download/$v/splash-$v-arm64-macos26.tar.gz"
+    echo "==> Downloading Splash $v"
+    curl -fL --no-progress-meter -o "$tmp/splash.tar.gz" "$url"
+    curl -fsSL -o "$tmp/splash.sha256" "$url.sha256"
+    echo "==> Verifying the download"
+    want=$(awk '{print $1}' "$tmp/splash.sha256"); got=$(shasum -a 256 "$tmp/splash.tar.gz" | awk '{print $1}')
+    [ -n "$want" ] && [ "$want" = "$got" ] || { echo "Checksum mismatch: the download is damaged"; exit 1; }
+    echo "==> Unpacking"
+    tar -xzf "$tmp/splash.tar.gz" -C "$tmp"
+    src=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d -name 'splash-*' | head -1)
+    [ -n "$src" ] && [ -f "$src/release.json" ] && [ -x "$src/engine/splash" ] && [ -f "$src/install/launcher.py" ] \
+      || { echo "The archive doesn't look like a Splash release"; exit 1; }
+    if [ -e "$dest" ]; then mv "$dest" "$tmp/previous"; fi
+    mv "$src" "$dest" || { [ ! -e "$tmp/previous" ] || mv "$tmp/previous" "$dest"; exit 1; }
+    echo "==> Pointing the splash command at $v"
+    mkdir -p "$(dirname "$wrapper")"
+    cat > "$wrapper.new" <<EOF
+    #!/bin/sh
+    export PYTHONDONTWRITEBYTECODE=1
+    exec "\$HOME/splash-$v/python/bin/python3" -u "\$HOME/splash-$v/install/launcher.py" "\$@"
+    EOF
+    chmod 755 "$wrapper.new"
+    mv "$wrapper.new" "$wrapper"
+    echo "==> Checking"
+    "$wrapper" --version
+    """#
+
+    static let splishBuild = #"""
+    xcrun -sdk macosx -f clang++ >/dev/null 2>&1 || { echo "Splish builds from source: install Xcode first"; exit 1; }
+    if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+      echo "==> Downloading Xcode's Metal toolchain"
+      xcodebuild -downloadComponent MetalToolchain
+    fi
+    echo "==> Building"
+    make -j4
+    echo "==> Setting up its Python environment"
+    make install-environment
+    """#
+
+    /// $1 checkout
+    static let splishUpdate = "set -eu\ncd \"$1\"\necho \"==> Pulling changes\"\ngit pull --ff-only\n" + splishBuild
+
+    /// $1 where to clone
+    static let splishInstall = "set -eu\necho \"==> Cloning Splish\"\ngit clone https://github.com/publicExcess/splish.git \"$1\"\ncd \"$1\"\n" + splishBuild
+
+    /// $1 version, $2 where the app goes, $3 the Team ID it must be signed with.
+    static let ollamaApp = #"""
+    set -eu
+    v="$1"; dest="$2"; team="$3"
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    echo "==> Downloading Ollama $v"
+    curl -fL --no-progress-meter -o "$tmp/Ollama.zip" "https://github.com/ollama/ollama/releases/download/v$v/Ollama-darwin.zip"
+    echo "==> Verifying the signature"
+    ditto -x -k "$tmp/Ollama.zip" "$tmp/x"
+    app="$tmp/x/Ollama.app"
+    codesign --verify --deep --strict "$app"
+    signer=$(codesign -dv "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+    [ "$signer" = "$team" ] || { echo "Signed by $signer, not Ollama ($team): not installing"; exit 1; }
+    if pgrep -xq Ollama || pgrep -fq 'ollama serve'; then
+      echo "==> Quitting Ollama"
+      osascript -e 'quit app "Ollama"' >/dev/null 2>&1 || true
+      i=0; while pgrep -xq Ollama && [ $i -lt 40 ]; do sleep 0.5; i=$((i+1)); done
+      pkill -x Ollama 2>/dev/null || true
+      pkill -f 'Ollama.app/Contents/Resources/ollama serve' 2>/dev/null || true
+      sleep 1
+    fi
+    echo "==> Installing"
+    rm -rf "$dest.new"
+    ditto "$app" "$dest.new"
+    if [ -e "$dest" ]; then mv "$dest" "$tmp/Ollama-previous.app"; fi
+    mv "$dest.new" "$dest" || { [ ! -e "$tmp/Ollama-previous.app" ] || mv "$tmp/Ollama-previous.app" "$dest"; exit 1; }
+    echo "==> Starting Ollama"
+    open -a "$dest"
+    """#
+
+    /// $1 the venv's bin folder, then the packages to upgrade.
+    static let mlxUpdate = #"""
+    set -eu
+    bin="$1"; shift
+    echo "==> Updating $*"
+    if [ -x "$bin/pip" ]; then
+      "$bin/python" -m pip install --upgrade "$@"
+    else
+      uv=$(command -v uv || true)
+      [ -n "$uv" ] || { echo "This environment has no pip, and uv isn't installed"; exit 1; }
+      "$uv" pip install --python "$bin/python" --upgrade "$@"
+    fi
+    """#
+
+    /// $1 the venv to create.
+    static let mlxInstall = #"""
+    set -eu
+    venv="$1"
+    [ ! -e "$venv" ] || { echo "$venv already exists"; exit 1; }
+    echo "==> Creating a Python environment"
+    if command -v uv >/dev/null 2>&1; then
+      uv venv --python 3.12 "$venv"
+      echo "==> Installing mlx-lm and mlx-vlm"
+      uv pip install --python "$venv/bin/python" mlx-lm mlx-vlm huggingface_hub
+    else
+      py=$(command -v python3.12 || command -v python3.13 || command -v python3)
+      "$py" -m venv "$venv"
+      echo "==> Installing mlx-lm and mlx-vlm"
+      "$venv/bin/python" -m pip install --upgrade pip mlx-lm mlx-vlm huggingface_hub
+    fi
+    """#
+
+    /// $@ the brew arguments.
+    static let brew = #"""
+    set -eu
+    brew=$(command -v brew || true)
+    [ -n "$brew" ] || { echo "Homebrew isn't installed"; exit 1; }
+    echo "==> brew $*"
+    "$brew" "$@"
+    """#
+}
+
+extension LibraryScanner {
+    /// Prepared weights that go with a model store: those its installs use and no install elsewhere
+    /// needs, plus — when no engine will be left to use them — entries nothing uses at all.
+    static func preparedGoing(with store: String, lastEngine: Bool) -> [PreparedEntry] {
+        let entries = preparedEntries()
+        let all = assemblyBlobs()
+        let remaining = all.filter { !$0.key.hasPrefix(store + "/") }
+        let usage = preparedUsage(entries, assemblies: all)
+        let mine = Set(all.keys.filter { $0.hasPrefix(store + "/") }.flatMap { usage[$0]?.keys.map { $0 } ?? [] })
+        let kept = Set(preparedUsage(entries, assemblies: remaining).values.flatMap(\.keys))
+        return entries.filter {
+            let w = "\($0.dir)/weights"
+            return !kept.contains(w) && (mine.contains(w) || lastEngine) && $0.dir.hasPrefix(splashWeightCache + "/")
+        }
+    }
+
+    /// The installs in one Splash or Splish model store, enough to remove them.
+    static func splashInstalls(in store: String) -> [LibraryInstance] {
+        var linksByAssembly: [String: [String]] = [:]
+        for link in splashLinks() where link.hasPrefix(store + "/") {
+            linksByAssembly[(link as NSString).resolvingSymlinksInPath, default: []].append(link)
+        }
+        return linksByAssembly.sorted { $0.key < $1.key }.compactMap { assembly, links in
+            guard let record = readJSON("\(assembly)/model.json"), let id = record["model"] as? String else { return nil }
+            let sources = record["sources"] as? [String: Any] ?? [:]
+            let repos = ["target", "draft"].compactMap { (sources[$0] as? [String: Any])?["repo"] as? String }
+            return LibraryInstance(backend: .splash, ref: id, weightsBytes: 0, files: [:],
+                                   assembly: assembly, links: links, sourceRepos: repos)
+        }
+    }
+}
+
+extension AppDelegate {
+    // MARK: engines
+
+    static var engineLogPath: String { "\(AppPaths.logPrefix)-engine.log" }
+    var enginesCheckedAt: Date? { UserDefaults.standard.object(forKey: "enginesCheckedAt") as? Date }
+
+    func enginesStale(hours: Double) -> Bool {
+        enginesCheckedAt.map { Date().timeIntervalSince($0) > hours * 3600 } ?? true
+    }
+
+    /// Find what's installed (local only: files, git, du), then merge the last known latest versions.
+    func rescanEngines(then: (() -> Void)? = nil) {
+        guard !engineScanInFlight else { return }
+        engineScanInFlight = true
+        AppDelegate.splishRoot = AppDelegate.findSplishRoot(hint: AppDelegate.splishRoot)
+        let root = AppDelegate.splishRoot
+        let bin = mlxBinDir
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var found = EngineScanner.scan(splishRoot: root, mlxBinDir: bin)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.engineScanInFlight = false
+                let releases = UserDefaults.standard.dictionary(forKey: "engineLatest") as? [String: String] ?? [:]
+                for k in [EngineKind.ollama, .splash] { found[k]?.latest = releases[k.rawValue] }
+                found[.mlx]?.latestPackages = UserDefaults.standard.dictionary(forKey: "engineLatestPackages") as? [String: String] ?? [:]
+                self.model.engines = found
+                self.model.enginesScannedAt = Date()
+                self.pushUpdate()
+                then?()
+            }
+        }
+    }
+
+    /// Ask GitHub, PyPI and Splish's remote for newer versions.
+    func checkEngineUpdates() {
+        guard !model.engineChecking else { return }
+        model.engineChecking = true
+        pushUpdate()
+        let engines = model.engines
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let found = EngineScanner.checkLatest(engines)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let d = UserDefaults.standard
+                var releases = d.dictionary(forKey: "engineLatest") as? [String: String] ?? [:]
+                releases.merge(found.releases) { _, new in new }
+                d.set(releases, forKey: "engineLatest")
+                if !found.packages.isEmpty { d.set(found.packages, forKey: "engineLatestPackages") }
+                // a check that reached nothing doesn't count as checked
+                if !found.releases.isEmpty || !found.packages.isEmpty { d.set(Date(), forKey: "enginesCheckedAt") }
+                self.model.engineChecking = false
+                self.rescanEngines()
+            }
+        }
+    }
+
+    /// Whether an engine is serving now, in a few words.
+    func engineUse(_ k: EngineKind) -> (running: Bool, text: String) {
+        switch k {
+        case .ollama:
+            guard model.ollamaUp else { return (false, "not running") }
+            return (true, model.loaded.isEmpty ? "running" : "\(model.loaded.count) loaded")
+        case .splash, .splish:
+            let servers = model.splashServers.filter { $0.running && $0.engine == k.rawValue }
+            guard let s = servers.first else { return (false, "idle") }
+            return (true, servers.count > 1 ? "\(servers.count) servers running" : "serving \(s.shortName)")
+        case .mlx:
+            let n = model.mlxServers.filter(\.running).count
+            return n == 0 ? (false, "idle") : (true, n == 1 ? "1 server running" : "\(n) servers running")
+        }
+    }
+
+    /// Why an engine can't be installed, updated or removed right now, or nil.
+    func engineBlocker(_ k: EngineKind, removing: Bool) -> String? {
+        if let j = model.engineJob, !j.failed { return "\(j.action) \(j.kind.rawValue) — wait for it to finish" }
+        if let job = model.hfJob, !job.done, !job.failed {
+            let busy: Bool
+            switch job.target {
+            case .ollama: busy = k == .ollama
+            case .mlx: busy = k == .mlx
+            case .splash: busy = k == .splash || k == .splish
+            }
+            if busy { return "A download or model start is in progress" }
+        }
+        switch k {
+        case .splash, .splish:
+            if engineUse(k).running { return "\(k.rawValue) is serving a model — stop it first" }
+        case .mlx:
+            if engineUse(.mlx).running { return "MLX servers are running — stop them first" }
+        case .ollama:
+            break
+        }
+        return nil
+    }
+
+    /// Runs an install or update script; its "==> " lines become the step in the engine's row.
+    func runEngineScript(_ k: EngineKind, action: String, script: String, args: [String],
+                         done: ((Bool) -> Void)? = nil) {
+        guard model.engineJob.map({ $0.failed }) ?? true else { return }
+        model.engineJob = EngineJob(kind: k, action: action, step: "Starting…")
+        pushUpdate()
+        FileManager.default.createFile(atPath: AppDelegate.engineLogPath, contents: Data())
+        let log = FileHandle(forWritingAtPath: AppDelegate.engineLogPath)
+        log?.write(Data("\(action) \(k.rawValue) — \(Date())\n".utf8))
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", script, "sh"] + args
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = EngineScanner.path
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        task.environment = env
+        task.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            log?.write(data)
+            let step = String(decoding: data, as: UTF8.self).split(separator: "\n")
+                .last { $0.hasPrefix("==> ") }.map { String($0.dropFirst(4)) }
+            guard let step else { return }
+            DispatchQueue.main.async {
+                self?.model.engineJob?.step = step
+                self?.pushUpdate()
+            }
+        }
+        task.terminationHandler = { [weak self] t in
+            pipe.fileHandleForReading.readabilityHandler = nil
+            log?.write(pipe.fileHandleForReading.readDataToEndOfFile())
+            try? log?.close()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let ok = t.terminationStatus == 0
+                self.store.log("engine", ["engine": k.rawValue, "action": action, "ok": ok])
+                if ok {
+                    self.model.engineJob = nil
+                } else {
+                    self.model.engineJob?.failed = true
+                    self.model.engineJob?.error = AppDelegate.lastEngineLogLine() ?? "exit status \(t.terminationStatus)"
+                }
+                done?(ok)
+                self.refreshAll()
+                self.rescanEngines()
+            }
+        }
+        do { try task.run() } catch {
+            model.engineJob?.failed = true
+            model.engineJob?.error = error.localizedDescription
+            pushUpdate()
+        }
+    }
+
+    static func lastEngineLogLine() -> String? {
+        guard let text = try? String(contentsOfFile: engineLogPath, encoding: .utf8) else { return nil }
+        return text.split(whereSeparator: { $0 == "\n" || $0 == "\r" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .last { !$0.isEmpty && !$0.hasPrefix("==> ") }
+    }
+
+    /// The latest release, from the last check or asked for now.
+    private func withLatest(_ k: EngineKind, action: String, _ go: @escaping (String) -> Void) {
+        if let v = model.engines[k]?.latest { go(v); return }
+        model.engineJob = EngineJob(kind: k, action: action, step: "Looking up the latest release…")
+        pushUpdate()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let v = EngineScanner.latestRelease(k)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let v else {
+                    self.model.engineJob = EngineJob(kind: k, action: action, step: "", failed: true,
+                                                     error: "Couldn't reach GitHub for the latest release")
+                    self.pushUpdate()
+                    return
+                }
+                self.model.engineJob = nil
+                go(v)
+            }
+        }
+    }
+
+    func installOrUpdateEngine(_ k: EngineKind) {
+        guard let st = model.engines[k], engineBlocker(k, removing: false) == nil else { return }
+        let action = st.installed ? "Updating" : "Installing"
+        switch k {
+        case .ollama:
+            if st.method == .homebrew {
+                runEngineScript(k, action: action, script: EngineScripts.brew, args: ["upgrade", "ollama"])
+                return
+            }
+            let dest = st.root ?? EngineScanner.ollamaApps[0]
+            withLatest(k, action: action) { [weak self] v in
+                self?.runEngineScript(k, action: action, script: EngineScripts.ollamaApp, args: [v, dest, EngineScanner.ollamaTeam])
+            }
+        case .splash:
+            if st.method == .homebrew {
+                runEngineScript(k, action: action, script: EngineScripts.brew, args: ["upgrade", "incoai/tap/splash"])
+                return
+            }
+            let old = st.method == .release ? st.root : nil
+            withLatest(k, action: action) { [weak self] v in
+                self?.runEngineScript(k, action: action, script: EngineScripts.splashRelease, args: [v, AppDelegate.splashCLI]) { ok in
+                    // the release it replaced goes to the Trash once the new one answers
+                    guard ok, let old, old != "\(NSHomeDirectory())/splash-\(v)",
+                          FileManager.default.fileExists(atPath: "\(old)/release.json") else { return }
+                    try? FileManager.default.trashItem(at: URL(fileURLWithPath: old), resultingItemURL: nil)
+                }
+            }
+        case .splish:
+            if st.installed, let root = st.root {
+                runEngineScript(k, action: action, script: EngineScripts.splishUpdate, args: [root])
+            } else {
+                runEngineScript(k, action: action, script: EngineScripts.splishInstall, args: [EngineScanner.splishInstallDir]) { [weak self] ok in
+                    guard ok else { return }
+                    AppDelegate.splishRoot = AppDelegate.findSplishRoot(hint: EngineScanner.splishInstallDir)
+                    self?.loadSplashAgents()
+                }
+            }
+        case .mlx:
+            if st.installed, let root = st.root {
+                let names = ["mlx-lm", "mlx-vlm", "mlx"].filter { st.packages[$0] != nil }
+                runEngineScript(k, action: action, script: EngineScripts.mlxUpdate, args: ["\(root)/bin"] + names)
+            } else {
+                let venv = EngineScanner.mlxInstallVenv
+                runEngineScript(k, action: action, script: EngineScripts.mlxInstall, args: [venv]) { ok in
+                    if ok { UserDefaults.standard.set("\(venv)/bin", forKey: "mlxBinDir") }
+                }
+            }
+        }
+    }
+
+    /// LaunchAgents (path, label) whose program is this engine's command.
+    private func engineAgents(_ k: EngineKind) -> [(path: String, label: String, plist: [String: Any])] {
+        guard k == .splash || k == .splish else { return [] }
+        var out: [(String, String, [String: Any])] = []
+        for f in ((try? FileManager.default.contentsOfDirectory(atPath: launchAgentsDir)) ?? []).sorted() where f.hasSuffix(".plist") {
+            let path = (launchAgentsDir as NSString).appendingPathComponent(f)
+            guard let data = FileManager.default.contents(atPath: path),
+                  let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+                  let label = plist["Label"] as? String,
+                  let exe = (plist["ProgramArguments"] as? [String])?.first else { continue }
+            let name = (exe as NSString).lastPathComponent
+            let real = (exe as NSString).resolvingSymlinksInPath
+            let match = k == .splash
+                ? name == "splash"
+                : name == "splish" && (AppDelegate.splishRoot.map { real.hasPrefix($0 + "/") } ?? true)
+            if match { out.append((path, label, plist)) }
+        }
+        return out
+    }
+
+    /// The command that takes over this engine's LaunchAgents, if the other engine is installed.
+    private func replacementCommand(for k: EngineKind) -> String? {
+        switch k {
+        case .splash: return model.engines[.splish]?.installed == true ? AppDelegate.splishRoot.map { "\($0)/splish" } : nil
+        case .splish: return model.engines[.splash]?.installed == true ? AppDelegate.splashCLI : nil
+        default: return nil
+        }
+    }
+
+    func planEngineRemoval(_ k: EngineKind, completion: @escaping (EngineRemovalPlan) -> Void) {
+        guard let st = model.engines[k] else { return }
+        var plan = EngineRemovalPlan()
+        plan.trash = st.trash
+        plan.trashBytes = st.bytes
+        let agents = engineAgents(k).map(\.label)
+        if replacementCommand(for: k) != nil { plan.switched = agents } else { plan.broken = agents }
+        switch k {
+        case .ollama:
+            plan.notes.append("Quits Ollama")
+            let ollama = model.library?.instances.filter { $0.backend == .ollama } ?? []
+            var blobs: [String: Double] = [:]
+            for i in ollama { blobs.merge(i.files) { a, _ in a } }
+            if !blobs.isEmpty {
+                plan.notes.append("its \(PanelContentView.formatBytes(blobs.values.reduce(0, +))) of models stay in ~/.ollama")
+            }
+        case .mlx:
+            plan.notes.append("models stay in the HF cache")
+        case .splash, .splish:
+            plan.notes.append("models stay in the HF cache")
+        }
+        let store = k == .splash ? AppDelegate.splashModelsDir : st.root.map { "\($0)/install/models" }
+        let last = (k == .splash || k == .splish) && replacementCommand(for: k) == nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let store {
+                plan.installs = LibraryScanner.splashInstalls(in: store).count
+                plan.preparedBytes = LibraryScanner.preparedGoing(with: store, lastEngine: last).reduce(0) { $0 + $1.bytes }
+            }
+            if k == .splash, FileManager.default.fileExists(atPath: EngineScanner.splashDataDir) {
+                plan.trash.append(EngineScanner.splashDataDir)
+                plan.trashBytes += EngineScanner.diskBytes([EngineScanner.splashDataDir])
+            }
+            DispatchQueue.main.async { completion(plan) }
+        }
+    }
+
+    /// Unlink the engine's models, delete prepared weights nothing else uses, move its folders to
+    /// the Trash and point its LaunchAgents at the other engine. Model files stay.
+    func removeEngine(_ k: EngineKind, completion: @escaping (String?) -> Void) {
+        guard let st = model.engines[k], st.managed else { completion("Not installed by a method the panel knows"); return }
+        if let b = engineBlocker(k, removing: true) { completion(b); return }
+        model.engineJob = EngineJob(kind: k, action: "Removing", step: "Removing…")
+        pushUpdate()
+        let agents = engineAgents(k)
+        let replacement = replacementCommand(for: k)
+        let store = k == .splash ? AppDelegate.splashModelsDir : st.root.map { "\($0)/install/models" }
+        let last = (k == .splash || k == .splish) && replacement == nil
+        let domain = "gui/\(getuid())"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let fm = FileManager.default
+            var failure: String?
+            func trash(_ path: String) {
+                guard failure == nil, fm.fileExists(atPath: path) || (try? fm.destinationOfSymbolicLink(atPath: path)) != nil else { return }
+                do { try fm.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil) }
+                catch { failure = "Couldn't move \(EngineScanner.tilde(path)) to the Trash: \(error.localizedDescription)" }
+            }
+            func step(_ s: String) { DispatchQueue.main.async { self?.model.engineJob?.step = s; self?.pushUpdate() } }
+
+            if let store {
+                step("Unlinking its models…")
+                // each removal also deletes the prepared weights only that install used
+                for inst in LibraryScanner.splashInstalls(in: store) {
+                    do { try LibraryScanner.removeSplashInstall(inst) } catch { failure = error.localizedDescription; break }
+                }
+                if failure == nil, last {
+                    step("Deleting prepared weights…")
+                    // no engine left to use them
+                    LibraryScanner.preparedGoing(with: store, lastEngine: true).forEach { LibraryScanner.removePreparedEntry($0.dir) }
+                }
+            }
+            if failure == nil, k == .ollama {
+                step("Quitting Ollama…")
+                _ = EngineScanner.run("/usr/bin/osascript", ["-e", "quit app \"Ollama\""])
+                for _ in 0..<40 where !EngineScanner.run("/usr/bin/pgrep", ["-x", "Ollama"]).isEmpty { usleep(250_000) }
+            }
+            if failure == nil {
+                step("Moving it to the Trash…")
+                if st.method == .homebrew {
+                    let formula = k == .splash ? "incoai/tap/splash" : "ollama"
+                    if EngineScanner.run("/bin/sh", ["-c", "brew uninstall \(formula)"]).isEmpty,
+                       fm.fileExists(atPath: st.root ?? "") {
+                        failure = "brew uninstall \(formula) failed"
+                    }
+                } else {
+                    st.trash.forEach(trash)
+                }
+                if k == .splash { trash(EngineScanner.splashDataDir) }
+            }
+            if failure == nil {
+                for a in agents {
+                    var plist = a.plist
+                    if let replacement, var args = plist["ProgramArguments"] as? [String] {
+                        args[0] = replacement
+                        plist["ProgramArguments"] = args
+                        var env = plist["EnvironmentVariables"] as? [String: String] ?? [:]
+                        // Splish reads the chip through sysctl and system_profiler (/usr/sbin)
+                        let path = env["PATH"] ?? "/usr/bin:/bin"
+                        if !path.split(separator: ":").contains("/usr/sbin") { env["PATH"] = path + ":/usr/sbin:/sbin" }
+                        plist["EnvironmentVariables"] = env
+                        if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+                            try? data.write(to: URL(fileURLWithPath: a.path))
+                        }
+                    }
+                    // launchd keeps the old program until the job is loaded again (the panel's Start loads it)
+                    _ = EngineScanner.run("/bin/launchctl", ["bootout", "\(domain)/\(a.label)"])
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.store.log("engine", ["engine": k.rawValue, "action": "Removing", "ok": failure == nil,
+                                          "error": failure ?? NSNull()])
+                if failure == nil {
+                    self.model.engineJob = nil
+                    if k == .splish {
+                        AppDelegate.splishRoot = nil
+                        UserDefaults.standard.removeObject(forKey: "splishDir")
+                    }
+                    if k == .splash || k == .splish { UserDefaults.standard.removeObject(forKey: "splashEngine") }
+                    if k == .mlx, let bin = UserDefaults.standard.string(forKey: "mlxBinDir"),
+                       st.root.map({ NSString(string: bin).expandingTildeInPath.hasPrefix($0 + "/") }) == true {
+                        UserDefaults.standard.removeObject(forKey: "mlxBinDir")
+                    }
+                } else {
+                    self.model.engineJob?.failed = true
+                    self.model.engineJob?.error = failure
+                }
+                self.loadSplashAgents()
+                self.refreshAll()
+                self.rescanLibrary()
+                self.rescanEngines()
+                completion(failure)
+            }
+        }
+    }
+}
+
 // MARK: - Content view
 
 // MARK: - UI helpers
@@ -3256,7 +4242,7 @@ private final class ModelRowView: HoverRowView {
 
 }
 
-final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
+final class PanelContentView: NSView, NSSearchFieldDelegate {
     private let model: PanelModel
     private weak var appDelegate: AppDelegate?
 
@@ -3283,28 +4269,34 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
     private(set) var fittedHeight: CGFloat = 600
 
     // Hugging Face
-    private var hfMetaLabel: NSTextField!
-    private var hfBody: NSStackView!
-    private var hfSearch: NSSearchField!
-    /// Debug screenshots: show the query a `--hf-search` run searched for.
-    func showSearchQuery(_ query: String) { hfSearch.stringValue = query }
-    private var hfRecent: NSButton!
-    private var hfStatusLabel: NSTextField!
-    private var hfRepoRow: NSView!
-    private var hfRepoPopup: NSPopUpButton!
     private var hfQuantRow: NSView!
     private var hfQuantPopup: NSPopUpButton!
+    private var hfCard: NSView!
+    private var hfCardStatusRow: NSView!
+    private var hfCardStatus: NSTextField!
     private var hfInfoLabel: NSTextField!
     private var hfActionRow: NSView!
     private var hfOllamaButton: ClosureButton!
     private var hfSplashButton: ClosureButton!
     private var hfMlxButton: ClosureButton!
-    private var hfFormatControl: NSSegmentedControl!
     private var hfJobRow: NSView!
     private var hfProgress: NSProgressIndicator!
     private var hfJobLabel: NSTextField!
     private var hfJobButton: ClosureButton!
-    private var hfResultsSig = ""
+    private var hfExpanded: String?                 // the Hugging Face result shown as a card
+    private var hfDebounce: Timer?
+    private var hfSearchedRecent: Bool?
+    private var hfExpandFirst = false               // debug `--hf-search`: open the first result
+
+    /// Debug screenshots (`--hf-search`): the Library tab with the query typed and its first result open.
+    func showSearchQuery(_ query: String) {
+        tab = .library
+        applyTab()
+        libSearch.stringValue = query
+        hfSearchedRecent = true
+        hfExpandFirst = true
+        rebuild()
+    }
     private var hfDetailSig = ""
 
     private var refreshTimer: Timer?
@@ -3312,12 +4304,17 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
     private var lastRowSig = ""
 
     // Tabs
-    private enum Tab: Int { case running, library, get }
+    private enum Tab: Int, CaseIterable { case running, library, engines }
     private var tabControl: NSSegmentedControl!
     private var tabStacks: [NSStackView] = []
     private var tab: Tab {
-        get { Tab(rawValue: UserDefaults.standard.integer(forKey: "panelTab")) ?? .running }
-        set { UserDefaults.standard.set(newValue.rawValue, forKey: "panelTab") }
+        get {
+            let d = UserDefaults.standard
+            if let name = d.string(forKey: "panelTabName") { return Tab.allCases.first { "\($0)" == name } ?? .running }
+            // before Get moved into Library: 0 Running, 1 Library, 2 Get, 3 Engines
+            return [.running, .library, .library, .engines][min(max(d.integer(forKey: "panelTab"), 0), 3)]
+        }
+        set { UserDefaults.standard.set("\(newValue)", forKey: "panelTabName") }
     }
 
     // Recent strip (Running tab)
@@ -3341,6 +4338,21 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
     private var libSig = ""
     private var pendingDelete: PendingDelete?
 
+    // Engines tab
+    private struct PendingEngineRemoval {
+        let kind: EngineKind
+        var plan: EngineRemovalPlan?
+        var busy = false
+        var error: String?
+    }
+    private var engMetaLabel: NSTextField!
+    private var engCheckButton: ClosureButton!
+    private var engList: NSStackView!
+    private var engChoiceRow: NSView!
+    private var engChoice: NSSegmentedControl!
+    private var engSig = ""
+    private var pendingEngineRemoval: PendingEngineRemoval?
+
     init(model: PanelModel, appDelegate: AppDelegate) {
         self.model = model
         self.appDelegate = appDelegate
@@ -3358,6 +4370,7 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
             if self.tab == .library, let snap = self.model.library, Date().timeIntervalSince(snap.scannedAt) > 60 {
                 self.appDelegate?.rescanLibrary()
             }
+            if self.tab == .engines { self.refreshEnginesIfStale() }
             self.rebuild()
         }
         applyTab()
@@ -3466,18 +4479,18 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
         header.addView(makeMoreMenu(), in: .trailing)
         addFull(header, to: root, after: 10)
 
-        // tabs — Running (memory now) · Library (on disk) · Get (Hugging Face)
-        tabControl = NSSegmentedControl(labels: ["Running", "Library", "Get"], trackingMode: .selectOne,
+        // tabs — Running (memory now) · Library (on disk, and Hugging Face search) · Engines
+        tabControl = NSSegmentedControl(labels: ["Running", "Library", "Engines"], trackingMode: .selectOne,
                                         target: self, action: #selector(tabChanged))
         tabControl.segmentDistribution = .fillEqually
         tabControl.controlSize = .small
         tabControl.font = uiFont(11, .medium)
         tabControl.selectedSegment = tab.rawValue
         tabControl.setToolTip("What's in memory now", forSegment: 0)
-        tabControl.setToolTip("Every model on disk — favorites, history, delete", forSegment: 1)
-        tabControl.setToolTip("Find models on Hugging Face", forSegment: 2)
+        tabControl.setToolTip("Every model on disk — favorites, history, delete — and Hugging Face search", forSegment: 1)
+        tabControl.setToolTip("Ollama, Splash, Splish and MLX — versions, updates, install, remove", forSegment: 2)
         addFull(tabControl, to: root, after: 12)
-        for _ in 0..<3 {
+        for _ in Tab.allCases {
             let t = NSStackView()
             t.orientation = .vertical
             t.alignment = .leading
@@ -3632,8 +4645,9 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
             }
         }
 
-        buildLibrary(in: tabStacks[1])
-        buildHFSection(in: tabStacks[2])
+        buildHFViews()
+        buildLibrary(in: tabStacks[Tab.library.rawValue])
+        buildEngines(in: tabStacks[Tab.engines.rawValue])
 
         // footer — keyboard hint
         addFull(hairline(), to: root, after: 8)
@@ -3670,16 +4684,6 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
             item.target = self
             more.menu?.addItem(item)
         }
-        // shown only when a Splish checkout is found (menuNeedsUpdate)
-        more.menu?.addItem(.separator())
-        for engine in ["Splash", "Splish"] {
-            let item = NSMenuItem(title: "Run Splash models with \(engine)", action: #selector(menuSplashEngine(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = engine
-            item.tag = 7
-            more.menu?.addItem(item)
-        }
-        more.menu?.delegate = self
         more.menu?.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Local AI Manager", action: #selector(menuQuit), keyEquivalent: "q")
         quit.target = self
@@ -3689,20 +4693,6 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
     }
 
     @objc private func menuRefresh() { refreshNow() }
-    @objc private func menuSplashEngine(_ sender: NSMenuItem) {
-        UserDefaults.standard.set(sender.representedObject as? String, forKey: "splashEngine")
-    }
-
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        let hasSplish = AppDelegate.splishRoot != nil
-        let current = appDelegate?.preferredSplashEngine
-        for item in menu.items where item.tag == 7 {
-            item.isHidden = !hasSplish
-            item.state = (item.representedObject as? String) == current ? .on : .off
-        }
-        // the separator before the engine items goes with them
-        if let i = menu.items.firstIndex(where: { $0.tag == 7 }), i > 0 { menu.items[i - 1].isHidden = !hasSplish }
-    }
     @objc private func menuQuit() { NSApp.terminate(nil) }
     @objc private func menuActivityMonitor() {
         NSWorkspace.shared.openApplication(
@@ -3737,75 +4727,23 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
         return row
     }
 
-    private func buildHFSection(in root: NSStackView) {
-        let (header, meta) = makeSectionHeader("HUGGING FACE")
-        hfMetaLabel = meta
-        addFull(header, to: root, after: 8)
-
-        hfBody = NSStackView()
-        hfBody.orientation = .vertical
-        hfBody.alignment = .width
-        hfBody.spacing = 6
-        hfBody.detachesHiddenViews = true
-
-        // search + recent filter
-        hfSearch = NSSearchField()
-        hfSearch.controlSize = .small
-        hfSearch.font = uiFont(12)
-        hfSearch.placeholderString = "Search GGUF models"
-        hfSearch.sendsWholeSearchString = true
-        hfSearch.sendsSearchStringImmediately = false
-        hfSearch.target = self
-        hfSearch.action = #selector(hfSearchSubmitted)
-        hfSearch.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        hfRecent = NSButton(checkboxWithTitle: "Last 90 days", target: self, action: #selector(hfSearchSubmitted))
-        hfRecent.controlSize = .small
-        hfRecent.font = uiFont(11)
-        hfRecent.state = .on
-        hfRecent.toolTip = "Only repos created in the last 90 days"
-        hfFormatControl = NSSegmentedControl(labels: [HFFormat.gguf.rawValue, HFFormat.mlx.rawValue],
-                                             trackingMode: .selectOne, target: self, action: #selector(hfFormatChanged))
-        hfFormatControl.controlSize = .small
-        hfFormatControl.font = uiFont(10.5, .medium)
-        hfFormatControl.selectedSegment = model.hfFormat == .gguf ? 0 : 1
-        hfFormatControl.setToolTip("GGUF — for Ollama and Splash", forSegment: 0)
-        hfFormatControl.setToolTip("MLX — served by mlx-lm / mlx-vlm", forSegment: 1)
-        hfFormatControl.setContentHuggingPriority(.required, for: .horizontal)
-        let searchRow = hstack()
-        searchRow.alignment = .centerY
-        searchRow.spacing = 8
-        searchRow.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-        searchRow.addArrangedSubview(hfSearch)
-        searchRow.addArrangedSubview(hfFormatControl)
-        hfBody.addArrangedSubview(searchRow)
-
-        hfStatusLabel = uiLabel("", 10.5, .regular, .secondaryLabelColor)
-        hfStatusLabel.lineBreakMode = .byTruncatingTail
-        hfStatusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        hfRecent.setContentHuggingPriority(.required, for: .horizontal)
-        let statusWrap = hstack()
-        statusWrap.alignment = .centerY
-        statusWrap.edgeInsets = NSEdgeInsets(top: 0, left: 2, bottom: 0, right: 0)
-        statusWrap.addView(hfStatusLabel, in: .leading)
-        statusWrap.addView(hfRecent, in: .trailing)
-        hfBody.addArrangedSubview(statusWrap)
-
-        hfRepoPopup = NSPopUpButton()
-        hfRepoPopup.controlSize = .small
-        hfRepoPopup.font = uiFont(11)
-        (hfRepoPopup.cell as? NSPopUpButtonCell)?.lineBreakMode = .byTruncatingMiddle
-        hfRepoPopup.target = self
-        hfRepoPopup.action = #selector(hfRepoPicked)
-        hfRepoRow = formRow("Model", hfRepoPopup)
-        hfBody.addArrangedSubview(hfRepoRow)
-
+    /// The expanded result's card (quant, fit, targets) and the job row. Built once and moved into
+    /// the Library list, so the quant selection survives list rebuilds.
+    private func buildHFViews() {
         hfQuantPopup = NSPopUpButton()
         hfQuantPopup.controlSize = .small
         hfQuantPopup.font = monoFont(11)
         hfQuantPopup.target = self
         hfQuantPopup.action = #selector(hfQuantPicked)
         hfQuantRow = formRow("Quant", hfQuantPopup)
-        hfBody.addArrangedSubview(hfQuantRow)
+
+        hfCardStatus = uiLabel("", 10.5, .regular, .secondaryLabelColor)
+        hfCardStatus.lineBreakMode = .byTruncatingTail
+        hfCardStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let statusRow = hstack()
+        statusRow.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
+        statusRow.addView(hfCardStatus, in: .leading)
+        hfCardStatusRow = statusRow
 
         // info + targets
         hfInfoLabel = uiLabel("", 10.5, .regular, .secondaryLabelColor, mono: true)
@@ -3826,13 +4764,24 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
         let actionRow = hstack()
         actionRow.alignment = .centerY
         actionRow.spacing = 6
-        actionRow.edgeInsets = NSEdgeInsets(top: 2, left: 10, bottom: 0, right: 10)
+        actionRow.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
         actionRow.addView(hfInfoLabel, in: .leading)
         actionRow.addView(hfOllamaButton, in: .trailing)
         actionRow.addView(hfSplashButton, in: .trailing)
         actionRow.addView(hfMlxButton, in: .trailing)
         hfActionRow = actionRow
-        hfBody.addArrangedSubview(actionRow)
+
+        let card = NSStackView(views: [hfQuantRow, hfCardStatusRow, hfActionRow])
+        card.orientation = .vertical
+        card.alignment = .width
+        card.spacing = 6
+        card.detachesHiddenViews = true
+        card.edgeInsets = NSEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 10
+        card.layer?.backgroundColor = NSColor.textColor.withAlphaComponent(0.05).cgColor
+        for v in card.arrangedSubviews { v.widthAnchor.constraint(equalTo: card.widthAnchor).isActive = true }
+        hfCard = card
 
         // job progress
         hfProgress = NSProgressIndicator()
@@ -3850,45 +4799,66 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
         let jobRow = hstack()
         jobRow.alignment = .centerY
         jobRow.spacing = 8
-        jobRow.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
+        jobRow.edgeInsets = NSEdgeInsets(top: 0, left: 2, bottom: 0, right: 0)
         jobRow.addView(hfProgress, in: .leading)
         jobRow.addView(hfJobLabel, in: .leading)
         jobRow.addView(hfJobButton, in: .trailing)
         hfJobRow = jobRow
-        hfBody.addArrangedSubview(jobRow)
+    }
 
-        for v in hfBody.arrangedSubviews {
-            v.widthAnchor.constraint(equalTo: hfBody.widthAnchor).isActive = true
+    private var hfRecentOnly: Bool {
+        get { UserDefaults.standard.object(forKey: "hfRecentOnly") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "hfRecentOnly") }
+    }
+
+    /// Search Hugging Face for what's in the Library search box (now, or after a typing pause).
+    private func searchHFFromLibrary(now: Bool) {
+        hfDebounce?.invalidate()
+        let q = libSearch.stringValue.trimmingCharacters(in: .whitespaces)
+        if q.isEmpty {
+            hfExpanded = nil
+            if !model.hfQuery.isEmpty || model.hfSearching || !model.hfResults.isEmpty { appDelegate?.searchHF("", recentOnly: hfRecentOnly) }
+            return
         }
-        addFull(hfBody, to: root, after: 10)
+        guard now || q.count >= 3 else { return }
+        let run = { [weak self] in
+            guard let self else { return }
+            // already answered (and not failed): nothing to do
+            if q == self.model.hfQuery, !self.model.hfSearching, self.model.hfError == nil, self.hfSearchedRecent == self.hfRecentOnly { return }
+            self.hfSearchedRecent = self.hfRecentOnly
+            self.appDelegate?.searchHF(q, recentOnly: self.hfRecentOnly)
+        }
+        if now { run() } else {
+            hfDebounce = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { _ in run() }
+        }
     }
 
-    @objc private func hfSearchSubmitted() {
-        let q = hfSearch.stringValue
-        guard !q.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        appDelegate?.searchHF(q, recentOnly: hfRecent.state == .on)
+    @objc private func libSearchSubmitted() { searchHFFromLibrary(now: true) }
+
+    @objc private func hfRecentToggled(_ sender: NSButton) {
+        hfRecentOnly = sender.state == .on
+        hfSearchedRecent = nil
+        searchHFFromLibrary(now: true)
     }
 
-    @objc private func hfFormatChanged() {
-        model.hfFormat = hfFormatControl.selectedSegment == 1 ? .mlx : .gguf
-        model.hfResults = []
-        model.hfDetail = nil
-        model.hfError = nil
-        model.hfSearching = false
-        rebuild()
-        hfSearchSubmitted()
+    private func toggleHFResult(_ r: HFRepo) {
+        if hfExpanded == r.id {
+            hfExpanded = nil
+        } else {
+            hfExpanded = r.id
+            appDelegate?.fetchHFDetail(r.id, format: r.format)
+        }
+        libSig = ""
+        updateLibrary()
+        updateHFCard()
+        fitHeight()
     }
 
-    @objc private func hfRepoPicked() {
-        guard let id = hfRepoPopup.selectedItem?.representedObject as? String else { return }
-        appDelegate?.fetchHFDetail(id)
-    }
-
-    @objc private func hfQuantPicked() { updateHF() }
+    @objc private func hfQuantPicked() { updateHFCard() }
 
     private var selectedQuant: HFQuant? {
-        guard let detail = model.hfDetail, let tag = hfQuantPopup.selectedItem?.representedObject as? String
-        else { return nil }
+        guard let detail = model.hfDetail, detail.id == hfExpanded,
+              let tag = hfQuantPopup.selectedItem?.representedObject as? String else { return nil }
         return detail.quants.first { $0.tag == tag }
     }
 
@@ -3903,68 +4873,136 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
         }
     }
 
-    /// Everything here is updated in place: rebuilding would drop focus and selections.
-    private func updateHF() {
+    /// Library keys and repos on disk, to mark Hugging Face results you already have.
+    private var diskIDs: Set<String> {
+        guard let snap = model.library else { return [] }
+        return Set(snap.models.flatMap { m in [m.key] + (m.repo.map { [$0.lowercased()] } ?? []) })
+    }
 
-        let job = model.hfJob
-        let jobActive = job.map { !$0.done && !$0.failed } ?? false
-        if let job, jobActive {
-            hfMetaLabel.stringValue = job.fraction.map { "\(job.target.rawValue) \(Int($0 * 100))%" }
-                ?? "\(job.target.rawValue)…"
-        } else {
-            hfMetaLabel.stringValue = ""
-        }
-        hfMetaLabel.textColor = .secondaryLabelColor
+    private func onDisk(_ repo: String, tag: String? = nil) -> Bool {
+        let ids = diskIDs
+        guard let tag else { return ids.contains(repo.lowercased()) }
+        return ids.contains("\(repo):\(tag)".lowercased())
+    }
 
-        // results → model popup (rebuilt only when the result list changes)
-        let resultsSig = model.hfResults.map(\.id).joined(separator: "|")
-        if resultsSig != hfResultsSig {
-            hfResultsSig = resultsSig
-            hfRepoPopup.removeAllItems()
-            let rel = RelativeDateTimeFormatter()
-            rel.unitsStyle = .short
-            for r in model.hfResults {
-                hfRepoPopup.addItem(withTitle: "\(r.id)  ·  \(AppDelegate.formatCount(r.downloads)) ↓")
-                hfRepoPopup.lastItem?.representedObject = r.id
-                hfRepoPopup.lastItem?.toolTip = "\(r.id)\n\(r.downloads) downloads · \(r.likes) likes"
-                    + (r.createdAt.map { "\ncreated \(rel.localizedString(for: $0, relativeTo: Date()))" } ?? "")
-            }
+    /// One Hugging Face result: chevron, name, format, on-disk mark, downloads · age. Click to expand.
+    private func makeHFResultRow(_ r: HFRepo, expanded: Bool, have: Bool) -> NSView {
+        let row = HoverRowView()
+        let h = hstack()
+        h.alignment = .centerY
+        h.spacing = 6
+        h.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 10)
+        h.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(h)
+        NSLayoutConstraint.activate([
+            h.topAnchor.constraint(equalTo: row.topAnchor),
+            h.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            h.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            h.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+        ])
+        let chevron = NSImageView(image: sysSymbol(expanded ? "chevron.down" : "chevron.right", fallback: "chevron.right", size: 9, weight: .semibold) ?? NSImage())
+        chevron.contentTintColor = .tertiaryLabelColor
+        chevron.translatesAutoresizingMaskIntoConstraints = false
+        chevron.widthAnchor.constraint(equalToConstant: 12).isActive = true
+        h.addView(chevron, in: .leading)
+
+        // the org gives way first (shortened, then dropped), then the name shortens in the middle
+        let badge = uiLabel(r.format.rawValue, 8.5, .bold, .secondaryLabelColor, mono: true)
+        let mark = have ? uiLabel("on disk", 9.5, .semibold, .systemGreen) : nil
+        let age = r.createdAt.map { " · " + PanelContentView.ago($0) } ?? ""
+        let detail = uiLabel("\(AppDelegate.formatCount(r.downloads)) ↓\(age)", 10.5, .regular, .secondaryLabelColor, mono: true)
+        let listWidth = libList.bounds.width > 0 ? libList.bounds.width : 368
+        let fixed = 8 + 10 + 12 + 6 * 4 + badge.fittingSize.width + (mark?.fittingSize.width ?? -6) + detail.fittingSize.width
+        let room = listWidth - fixed - 4
+        let parts = r.id.split(separator: "/", maxSplits: 1).map(String.init)
+        let nameAttrs: [NSAttributedString.Key: Any] = [.font: uiFont(12.5), .foregroundColor: NSColor.labelColor]
+        let orgAttrs: [NSAttributedString.Key: Any] = [.font: uiFont(12), .foregroundColor: NSColor.tertiaryLabelColor]
+        let repoName = parts.last ?? r.id
+        let nameWidth = (repoName as NSString).size(withAttributes: nameAttrs).width
+        var org = parts.count == 2 ? parts[0] + "/" : ""
+        let orgRoom = room - nameWidth
+        if !org.isEmpty, (org as NSString).size(withAttributes: orgAttrs).width > orgRoom {
+            org = orgRoom < 44 ? "" : {
+                var cut = parts[0]
+                while !cut.isEmpty, ((cut + "…/") as NSString).size(withAttributes: orgAttrs).width > orgRoom { cut.removeLast() }
+                return cut.isEmpty ? "" : cut + "…/"
+            }()
         }
-        hfRepoRow.isHidden = model.hfResults.isEmpty
+        let middle = NSMutableParagraphStyle()
+        middle.lineBreakMode = .byTruncatingMiddle
+        let text = NSMutableAttributedString(string: org, attributes: orgAttrs)
+        text.append(NSAttributedString(string: repoName, attributes: nameAttrs))
+        text.addAttribute(.paragraphStyle, value: middle, range: NSRange(location: 0, length: text.length))
+        let name = NSTextField(labelWithAttributedString: text)
+        name.maximumNumberOfLines = 1
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let rel = RelativeDateTimeFormatter()
+        rel.unitsStyle = .short
+        name.toolTip = "\(r.id)\n\(r.downloads) downloads · \(r.likes) likes"
+            + (r.createdAt.map { "\ncreated \(rel.localizedString(for: $0, relativeTo: Date()))" } ?? "")
+            + (have ? "\nAlready on disk (see above)" : "")
+        h.addView(name, in: .leading)
+
+        badge.wantsLayer = true
+        badge.layer?.cornerRadius = 3.5
+        badge.layer?.backgroundColor = NSColor.textColor.withAlphaComponent(0.08).cgColor
+        badge.toolTip = r.format == .gguf ? "GGUF — for Ollama and Splash" : "MLX — served by mlx-lm / mlx-vlm"
+        badge.setContentHuggingPriority(.required, for: .horizontal)
+        badge.setContentCompressionResistancePriority(.required, for: .horizontal)
+        h.addView(badge, in: .leading)
+        if let mark {
+            mark.setContentCompressionResistancePriority(.required, for: .horizontal)
+            h.addView(mark, in: .leading)
+        }
+
+        detail.setContentHuggingPriority(.required, for: .horizontal)
+        detail.setContentCompressionResistancePriority(.required, for: .horizontal)
+        h.addView(detail, in: .trailing)
+
+        let click = ClosureClickGesture { [weak self] in self?.toggleHFResult(r) }
+        row.addGestureRecognizer(click)
+        return row
+    }
+
+    /// The expanded card, updated in place: rebuilding would drop the quant selection.
+    private func updateHFCard() {
+        guard let id = hfExpanded else { return }
+        let detail = model.hfDetail.flatMap { $0.id == id ? $0 : nil }
+        let jobActive = model.hfJob.map { !$0.done && !$0.failed } ?? false
 
         // detail → quant popup, defaulting to a Q4_K_M-class quant
-        let detailSig = model.hfDetail.map { d in d.id + d.quants.map(\.tag).joined() } ?? ""
+        let have = diskIDs
+        let detailSig = detail.map { d in d.id + d.quants.map(\.tag).joined() + "\(have.count)" } ?? ""
         if detailSig != hfDetailSig {
             hfDetailSig = detailSig
+            let previous = hfQuantPopup.selectedItem?.representedObject as? String
             hfQuantPopup.removeAllItems()
-            for q in model.hfDetail?.quants ?? [] {
-                hfQuantPopup.addItem(withTitle: String(format: "%@  ·  %.1f GB", q.tag, q.sizeGB))
+            for q in detail?.quants ?? [] {
+                let mine = detail?.format == .mlx ? have.contains(id.lowercased()) : have.contains("\(id):\(q.tag)".lowercased())
+                hfQuantPopup.addItem(withTitle: String(format: "%@  ·  %.1f GB", q.tag, q.sizeGB) + (mine ? "  ·  on disk" : ""))
                 hfQuantPopup.lastItem?.representedObject = q.tag
             }
-            let tags = model.hfDetail?.quants.map(\.tag) ?? []
-            if let i = tags.firstIndex(where: { $0.uppercased().hasSuffix("Q4_K_M") })
+            let tags = detail?.quants.map(\.tag) ?? []
+            if let previous, let i = tags.firstIndex(of: previous) {
+                hfQuantPopup.selectItem(at: i)
+            } else if let i = tags.firstIndex(where: { $0.uppercased().hasSuffix("Q4_K_M") })
                 ?? tags.firstIndex(where: { $0.uppercased().contains("Q4") }) {
                 hfQuantPopup.selectItem(at: i)
             }
         }
-        hfQuantRow.isHidden = (model.hfDetail?.quants.isEmpty ?? true)
+        hfQuantRow.isHidden = detail?.quants.isEmpty ?? true
 
-        // status line: searching / errors / loading detail
         var status = ""
-        if model.hfSearching { status = "Searching Hugging Face…" }
-        else if let err = model.hfError { status = err }
-        else if !model.hfResults.isEmpty, model.hfDetail == nil { status = "Reading repo…" }
-        else if model.hfResults.isEmpty {
-            status = model.hfFormat == .gguf ? "For Ollama and Splash" : "Served on :\(AppDelegate.panelMlxPort) by mlx-lm"
-        }
-        hfStatusLabel.stringValue = status
-        hfStatusLabel.textColor = model.hfError != nil ? .systemOrange : .secondaryLabelColor
-        hfSearch.placeholderString = "Search \(model.hfFormat.rawValue) models"
+        if detail == nil { status = model.hfDetailError ?? "Reading repo…" }
+        else if let err = model.hfDetailError { status = err }
+        hfCardStatus.stringValue = status
+        hfCardStatus.textColor = model.hfDetailError != nil ? .systemOrange : .secondaryLabelColor
+        hfCardStatusRow.isHidden = status.isEmpty
 
         // info + target buttons
         let q = selectedQuant
         hfActionRow.isHidden = q == nil
-        if let detail = model.hfDetail, let q {
+        if let detail, let q {
             var parts: [String] = []
             if let arch = detail.architecture { parts.append(arch) }
             if let ctx = detail.contextTokens { parts.append("\(AppDelegate.formatTokens(ctx)) ctx") }
@@ -4006,28 +5044,31 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
                 : "Serve \(detail.id):\(q.tag) on :\(AppDelegate.panelSplashPort) — replaces the model running there"
                     + (arch == nil ? "\nArchitecture unknown — Splash may reject it" : "")
         }
+    }
 
-        // job line
+    /// Download or start progress, pinned at the top of the Library tab.
+    private func updateHFJob() {
+        let job = model.hfJob
+        let jobActive = job.map { !$0.done && !$0.failed } ?? false
         hfJobRow.isHidden = job == nil
-        if let job {
-            if let f = job.fraction {
-                hfProgress.isIndeterminate = false
-                hfProgress.stopAnimation(nil)
-                hfProgress.doubleValue = f
-            } else {
-                hfProgress.isIndeterminate = true
-                if jobActive { hfProgress.startAnimation(nil) } else { hfProgress.stopAnimation(nil) }
-            }
-            hfProgress.isHidden = !jobActive && job.fraction == nil
-            hfJobLabel.stringValue = "\(job.target.rawValue): \(job.status)"
-            hfJobLabel.toolTip = "\(job.model)\n\(job.status)"
-            hfJobLabel.textColor = job.failed ? .systemOrange : .secondaryLabelColor
-            hfJobButton.title = jobActive ? "Cancel" : "Clear"
-            hfJobButton.toolTip = !jobActive ? "Dismiss"
-                : job.target == .splash ? "Stop the Splash server that is starting"
-                : job.target == .mlx && job.started != nil ? "Stop the MLX server that is starting"
-                : "Stop the download (it resumes next time)"
+        guard let job else { return }
+        if let f = job.fraction {
+            hfProgress.isIndeterminate = false
+            hfProgress.stopAnimation(nil)
+            hfProgress.doubleValue = f
+        } else {
+            hfProgress.isIndeterminate = true
+            if jobActive { hfProgress.startAnimation(nil) } else { hfProgress.stopAnimation(nil) }
         }
+        hfProgress.isHidden = !jobActive && job.fraction == nil
+        hfJobLabel.stringValue = "\(job.target.rawValue): \(job.status)"
+        hfJobLabel.toolTip = "\(job.model)\n\(job.status)"
+        hfJobLabel.textColor = job.failed ? .systemOrange : .secondaryLabelColor
+        hfJobButton.title = jobActive ? "Cancel" : "Clear"
+        hfJobButton.toolTip = !jobActive ? "Dismiss"
+            : job.target == .splash ? "Stop the Splash server that is starting"
+            : job.target == .mlx && job.started != nil ? "Stop the MLX server that is starting"
+            : "Stop the download (it resumes next time)"
     }
 
     // MARK: refresh
@@ -4114,8 +5155,8 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
                 if case let .model(r) = spec.kind { (rowCache[spec.key] as? ModelRowView)?.update(r) }
             }
         }
-        updateHF()
-        if tab == .library { updateLibrary() }
+        if tab == .library { updateLibrary(); updateHFJob(); updateHFCard() }
+        if tab == .engines { updateEngines() }
         updateTabLabels()
         fitHeight()
     }
@@ -4129,7 +5170,19 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
             appDelegate?.rescanLibrary()
         }
         rebuild()
-        if tab == .get { window?.makeFirstResponder(hfSearch) }
+        if tab == .library { window?.makeFirstResponder(libSearch) }
+        if tab == .engines { refreshEnginesIfStale() }
+    }
+
+    private func refreshEnginesIfStale() {
+        guard let app = appDelegate else { return }
+        if model.enginesScannedAt.map({ Date().timeIntervalSince($0) > 30 }) ?? true {
+            app.rescanEngines { [weak app] in
+                if app?.enginesStale(hours: 12) == true { app?.checkEngineUpdates() }
+            }
+        } else if app.enginesStale(hours: 12) {
+            app.checkEngineUpdates()
+        }
     }
 
     private func applyTab() {
@@ -4137,17 +5190,22 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
         if tabControl.selectedSegment != tab.rawValue { tabControl.selectedSegment = tab.rawValue }
         graphView.updateAnimation()
         if tab == .library { libSig = "" }
+        if tab == .engines { engSig = "" }
     }
 
     private func updateTabLabels() {
-        var get = "Get"
+        var lib = model.library.map { "Library · \($0.models.count)" } ?? "Library"
         if let job = model.hfJob, !job.done, !job.failed {
-            get = job.fraction.map { "Get · \(Int($0 * 100))%" } ?? "Get · …"
+            lib = job.fraction.map { "Library · ↓\(Int($0 * 100))%" } ?? "Library · ↓…"
         }
-        if tabControl.label(forSegment: 2) != get { tabControl.setLabel(get, forSegment: 2) }
-        let n = model.library?.models.count
-        let lib = n.map { "Library · \($0)" } ?? "Library"
-        if tabControl.label(forSegment: 1) != lib { tabControl.setLabel(lib, forSegment: 1) }
+        if tabControl.label(forSegment: Tab.library.rawValue) != lib { tabControl.setLabel(lib, forSegment: Tab.library.rawValue) }
+        var eng = "Engines"
+        if let j = model.engineJob, !j.failed { eng = "Engines · …" }
+        else {
+            let n = model.engines.values.filter(\.updateAvailable).count
+            if n > 0 { eng = "Engines · ↑\(n)" }
+        }
+        if tabControl.label(forSegment: Tab.engines.rawValue) != eng { tabControl.setLabel(eng, forSegment: Tab.engines.rawValue) }
     }
 
     static func formatBytes(_ b: Double) -> String {
@@ -4191,6 +5249,394 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: engines
+
+    private func buildEngines(in eng: NSStackView) {
+        let check = rowButton("Check for Updates", width: 112)
+        check.onAction = { [weak self] in self?.appDelegate?.checkEngineUpdates() }
+        engCheckButton = check
+        let (header, meta) = makeSectionHeader("ENGINES", accessory: check)
+        engMetaLabel = meta
+        addFull(header, to: eng, after: 8)
+
+        engList = NSStackView()
+        engList.orientation = .vertical
+        engList.alignment = .width
+        engList.spacing = 4
+        addFull(engList, to: eng, after: 10)
+
+        // which engine serves Splash models, when both are installed
+        engChoice = NSSegmentedControl(labels: ["Splash", "Splish"], trackingMode: .selectOne,
+                                       target: self, action: #selector(engineChoiceChanged))
+        engChoice.controlSize = .small
+        engChoice.font = uiFont(10.5, .medium)
+        engChoice.setContentHuggingPriority(.required, for: .horizontal)
+        let choiceRow = hstack()
+        choiceRow.alignment = .centerY
+        choiceRow.spacing = 8
+        choiceRow.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 0)
+        let choiceLabel = uiLabel("Run Splash models with", 11.5, .regular, .secondaryLabelColor)
+        choiceLabel.toolTip = "Load and Start use this engine for models installed in both.\nA model installed in only one store runs with that engine."
+        choiceRow.addView(choiceLabel, in: .leading)
+        choiceRow.addView(engChoice, in: .trailing)
+        engChoiceRow = choiceRow
+        addFull(choiceRow, to: eng, after: 8)
+
+        let note = uiLabel("Removing moves program folders to the Trash. Model files stay; prepared weights go only when no other engine uses them.",
+                           10, .regular, .tertiaryLabelColor)
+        note.lineBreakMode = .byWordWrapping
+        note.maximumNumberOfLines = 3
+        note.preferredMaxLayoutWidth = 360
+        addFull(note, to: eng, after: 4)
+    }
+
+    @objc private func engineChoiceChanged() {
+        UserDefaults.standard.set(engChoice.selectedSegment == 1 ? "Splish" : "Splash", forKey: "splashEngine")
+    }
+
+    private func updateEngines() {
+        guard let app = appDelegate else { return }
+        if model.engineChecking {
+            engMetaLabel.stringValue = "checking…"
+        } else if let at = app.enginesCheckedAt {
+            engMetaLabel.stringValue = "checked \(PanelContentView.ago(at))" + (PanelContentView.ago(at) == "now" ? "" : " ago")
+        } else {
+            engMetaLabel.stringValue = "not checked yet"
+        }
+        engCheckButton.isEnabled = !model.engineChecking && !model.engines.isEmpty
+        let both = model.engines[.splash]?.installed == true && model.engines[.splish]?.installed == true
+        engChoiceRow.isHidden = !both
+        engChoice.selectedSegment = app.preferredSplashEngine == "Splish" ? 1 : 0
+
+        var sig = "\(model.enginesScannedAt?.timeIntervalSince1970 ?? 0)|\(model.engineChecking)|"
+        for k in EngineKind.allCases {
+            let st = model.engines[k]
+            sig += "\(k):\(st?.installed ?? false):\(st?.version ?? ""):\(st?.updateText ?? ""):\(app.engineUse(k).text):"
+            sig += "\(app.engineBlocker(k, removing: false) ?? ""):\(app.engineBlocker(k, removing: true) ?? "");"
+        }
+        if let j = model.engineJob { sig += "job:\(j.kind):\(j.step):\(j.failed):\(j.error ?? "")" }
+        if let p = pendingEngineRemoval { sig += "rm:\(p.kind):\(p.plan != nil):\(p.busy):\(p.error ?? "")" }
+        guard sig != engSig else { return }
+        engSig = sig
+
+        engList.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        guard !model.engines.isEmpty else {
+            let row = ModelRowView(ModelRow(dot: .tertiaryLabelColor, hollow: true, name: "Looking for engines…", dimName: true))
+            engList.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: engList.widthAnchor).isActive = true
+            return
+        }
+        for k in EngineKind.allCases {
+            guard let st = model.engines[k] else { continue }
+            let v: NSView
+            if let p = pendingEngineRemoval, p.kind == k { v = makeEngineRemovalRow(st, p) } else { v = makeEngineRow(st) }
+            engList.addArrangedSubview(v)
+            v.widthAnchor.constraint(equalTo: engList.widthAnchor).isActive = true
+        }
+    }
+
+    private func makeEngineRow(_ st: EngineState) -> NSView {
+        guard let app = appDelegate else { return NSView() }
+        let k = st.kind
+        let job = model.engineJob.flatMap { $0.kind == k ? $0 : nil }
+        let use = app.engineUse(k)
+        let row = HoverRowView(height: 46)
+        let h = hstack()
+        h.alignment = .centerY
+        h.spacing = 8
+        h.edgeInsets = NSEdgeInsets(top: 5, left: 10, bottom: 5, right: 4)
+        h.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(h)
+        NSLayoutConstraint.activate([
+            h.topAnchor.constraint(equalTo: row.topAnchor),
+            h.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            h.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            h.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+        ])
+
+        // dot: green while serving, grey when installed, a ring when not
+        let dot = NSView()
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3.5
+        if st.installed {
+            dot.layer?.backgroundColor = (use.running ? NSColor.systemGreen : NSColor.tertiaryLabelColor).cgColor
+        } else {
+            dot.layer?.borderWidth = 1
+            dot.layer?.borderColor = NSColor.tertiaryLabelColor.cgColor
+        }
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([dot.widthAnchor.constraint(equalToConstant: 7), dot.heightAnchor.constraint(equalToConstant: 7)])
+        h.addView(dot, in: .leading)
+
+        // line 1: name, version, update chip
+        let top = hstack()
+        top.alignment = .firstBaseline
+        top.spacing = 6
+        top.addArrangedSubview(uiLabel(k.rawValue, 12.5, .semibold, st.installed ? .labelColor : .secondaryLabelColor))
+        if st.installed {
+            var version = st.version ?? "unknown version"
+            if k == .splish, let date = st.extra { version += " · \(date)" }
+            let vl = uiLabel(version, 10.5, .regular, .secondaryLabelColor, mono: true)
+            vl.lineBreakMode = .byTruncatingTail
+            vl.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(500), for: .horizontal)
+            if k == .mlx, let extra = st.extra, !extra.isEmpty { vl.toolTip = "mlx-lm \(st.version ?? "?") · \(extra)" }
+            top.addArrangedSubview(vl)
+        }
+        if let up = st.updateText {
+            let chip = uiLabel("↑ \(up)", 10, .semibold, .controlAccentColor, mono: true)
+            chip.lineBreakMode = .byTruncatingTail
+            chip.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            chip.toolTip = k == .splish ? "Upstream is at \(st.latest ?? "?")"
+                : k == .mlx ? "Updates: " + st.newerPackages.sorted { $0.key < $1.key }.map { "\($0.key) \(st.packages[$0.key] ?? "?") → \($0.value)" }.joined(separator: ", ")
+                : "Update available: \(up)"
+            top.addArrangedSubview(chip)
+        }
+
+        // line 2: what's going on, or where it lives
+        let line2 = hstack()
+        line2.alignment = .centerY
+        line2.spacing = 5
+        var detail: String
+        var color = NSColor.secondaryLabelColor
+        if let job, job.failed {
+            detail = "\(job.action) failed: \(job.error ?? "see the log")"
+            color = .systemOrange
+        } else if let job {
+            let spin = NSProgressIndicator()
+            spin.style = .spinning
+            spin.controlSize = .small
+            spin.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([spin.widthAnchor.constraint(equalToConstant: 11), spin.heightAnchor.constraint(equalToConstant: 11)])
+            spin.startAnimation(nil)
+            line2.addArrangedSubview(spin)
+            detail = job.step
+        } else if !st.installed {
+            detail = k.blurb
+            color = .tertiaryLabelColor
+        } else {
+            var parts = [st.root.map(EngineScanner.tilde) ?? "?"]
+            if st.bytes > 0 { parts.append(PanelContentView.formatBytes(st.bytes)) }
+            parts.append(use.text)
+            if st.method == .homebrew { parts.append("Homebrew") }
+            if st.method == .other { parts.append("installed outside the panel") }
+            detail = parts.joined(separator: " · ")
+        }
+        let dl = uiLabel(detail, 10.5, .regular, color)
+        dl.lineBreakMode = .byTruncatingMiddle
+        dl.toolTip = detail
+        dl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        line2.addArrangedSubview(dl)
+
+        let text = NSStackView(views: [top, line2])
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 2
+        text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        h.addView(text, in: .leading)
+
+        // action: Install, Update, or Dismiss after a failure
+        if let job, job.failed {
+            let b = rowButton("Dismiss")
+            b.onAction = { [weak self] in
+                self?.model.engineJob = nil
+                self?.engSig = ""
+                self?.updateEngines()
+            }
+            h.addView(b, in: .trailing)
+        } else if job == nil, !st.installed || (st.managed && st.updateAvailable) {
+            let b = rowButton(st.installed ? "Update" : "Install")
+            let blocker = app.engineBlocker(k, removing: false)
+            b.isEnabled = blocker == nil
+            var tip = blocker ?? (st.installed ? "Update \(k.rawValue) to \(st.updateText ?? "the latest")" : "Install \(k.rawValue)")
+            if blocker == nil {
+                switch k {
+                case .ollama where st.installed:
+                    tip += "\nQuits and restarts Ollama" + (model.loaded.isEmpty ? "" : " — loaded models unload")
+                case .ollama: tip += "\nDownloads Ollama.app into /Applications"
+                case .splash where !st.installed: tip += "\nUnpacks the release in ~/splash-<version> and adds the splash command to ~/.local/bin"
+                case .splash where st.method == .release: tip += "\nThe old release folder goes to the Trash"
+                case .splish: tip += "\nPulls and builds from source (a few minutes; needs Xcode)"
+                case .mlx where !st.installed: tip += "\nCreates a Python environment in ~/.venv-mlx"
+                default: break
+                }
+            }
+            b.toolTip = tip
+            b.onAction = { [weak app] in app?.installOrUpdateEngine(k) }
+            h.addView(b, in: .trailing)
+        }
+
+        let more = NSPopUpButton(frame: .zero, pullsDown: true)
+        more.isBordered = false
+        more.controlSize = .small
+        (more.cell as? NSPopUpButtonCell)?.arrowPosition = .noArrow
+        more.menu = engineMenu(st)
+        more.toolTip = "Reveal, release notes, log, remove"
+        more.translatesAutoresizingMaskIntoConstraints = false
+        more.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        h.addView(more, in: .trailing)
+        return row
+    }
+
+    private func engineMenu(_ st: EngineState) -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let title = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        title.image = sysSymbol("ellipsis.circle", fallback: "ellipsis", size: 12)
+        menu.addItem(title)
+        guard let app = appDelegate else { return menu }
+        let k = st.kind
+        let idle = model.engineJob.map(\.failed) ?? true
+        if st.installed, !st.updateAvailable, st.managed {
+            let again = k == .splish ? "Rebuild" : "Reinstall"
+            if k == .splish || k == .mlx {
+                menu.addItem(menuItem(again, enabled: idle && app.engineBlocker(k, removing: false) == nil) { [weak app] in
+                    app?.installOrUpdateEngine(k)
+                })
+            }
+        }
+        menu.addItem(menuItem("Check for Updates", enabled: !model.engineChecking) { [weak app] in app?.checkEngineUpdates() })
+        if let root = st.root {
+            menu.addItem(menuItem("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: root)])
+            })
+        }
+        if let url = URL(string: k.homepage) {
+            menu.addItem(menuItem(k == .splish ? "Open Commits on GitHub" : "Open Release Notes") { NSWorkspace.shared.open(url) })
+        }
+        if FileManager.default.fileExists(atPath: AppDelegate.engineLogPath) {
+            menu.addItem(menuItem("Show Last Install Log") {
+                NSWorkspace.shared.open(URL(fileURLWithPath: AppDelegate.engineLogPath))
+            })
+        }
+        if st.installed {
+            menu.addItem(.separator())
+            let item = menuItem("Remove \(k.rawValue)…", enabled: st.managed && idle) { [weak self] in self?.askRemoveEngine(k) }
+            if !st.managed { item.toolTip = "Installed outside the panel — remove it the way it was installed" }
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    private func askRemoveEngine(_ k: EngineKind) {
+        pendingEngineRemoval = PendingEngineRemoval(kind: k)
+        engSig = ""
+        updateEngines()
+        fitHeight()
+        appDelegate?.planEngineRemoval(k) { [weak self] plan in
+            guard let self, self.pendingEngineRemoval?.kind == k else { return }
+            self.pendingEngineRemoval?.plan = plan
+            self.engSig = ""
+            self.updateEngines()
+            self.fitHeight()
+        }
+    }
+
+    /// Inline confirmation: what goes to the Trash, what's deleted, what changes, and anything that blocks it.
+    private func makeEngineRemovalRow(_ st: EngineState, _ p: PendingEngineRemoval) -> NSView {
+        guard let app = appDelegate else { return NSView() }
+        let k = st.kind
+        let fmt = PanelContentView.formatBytes
+        let blocker = app.engineBlocker(k, removing: true)
+        let row = HoverRowView(height: 70)
+        row.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.09).cgColor
+        row.layer?.borderWidth = 0.5
+        row.layer?.borderColor = NSColor.systemRed.withAlphaComponent(0.35).cgColor
+
+        var lines: [String] = []
+        var tip: [String] = []
+        let titleText: String
+        var noteColor = NSColor.secondaryLabelColor
+        if let plan = p.plan {
+            var head = "Remove \(k.rawValue)"
+            if plan.trashBytes > 0 { head += " — \(fmt(plan.trashBytes)) to the Trash" }
+            titleText = head
+            var what: [String] = []
+            if plan.preparedBytes > 1_000_000 { what.append("deletes \(fmt(plan.preparedBytes)) of prepared weights") }
+            if plan.installs > 0 { what.append("unlinks \(plan.installs) model\(plan.installs == 1 ? "" : "s")") }
+            what += plan.notes
+            lines.append(what.joined(separator: " · "))
+            if !plan.switched.isEmpty {
+                lines.append("\(plan.switched.count == 1 ? "1 background server switches" : "\(plan.switched.count) background servers switch") to \(k == .splash ? "Splish" : "Splash")")
+            }
+            if !plan.broken.isEmpty {
+                lines.append("\(plan.broken.count == 1 ? "1 background server stops" : "\(plan.broken.count) background servers stop") working")
+            }
+            tip.append("Moves to the Trash:\n" + plan.trash.map { "   " + EngineScanner.tilde($0) }.joined(separator: "\n"))
+            if !plan.switched.isEmpty { tip.append("Switched: " + plan.switched.joined(separator: ", ")) }
+            if !plan.broken.isEmpty { tip.append("Will fail to start: " + plan.broken.joined(separator: ", ")) }
+            if k == .ollama { tip.append("/usr/local/bin/ollama will point at the removed app") }
+        } else {
+            titleText = "Remove \(k.rawValue)"
+            lines.append("Working out what goes…")
+        }
+        if let err = p.error { lines = [err]; noteColor = .systemOrange }
+        else if p.busy { lines = [model.engineJob?.step ?? "Removing…"] }
+        else if let blocker { lines = [blocker]; noteColor = .systemOrange }
+
+        let title = uiLabel(titleText, 12, .semibold)
+        title.lineBreakMode = .byTruncatingTail
+        let note = uiLabel(lines.joined(separator: "\n"), 10.5, .regular, noteColor)
+        note.maximumNumberOfLines = 2
+        note.lineBreakMode = .byTruncatingTail
+        let tipText = tip.joined(separator: "\n\n")
+        title.toolTip = tipText
+        note.toolTip = tipText
+        let text = NSStackView(views: [title, note])
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 2
+        for v in [title, note] { v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal) }
+
+        let cancel = rowButton(p.error == nil ? "Cancel" : "Close", width: 54)
+        cancel.isEnabled = !p.busy
+        cancel.onAction = { [weak self] in
+            self?.pendingEngineRemoval = nil
+            if self?.model.engineJob?.failed == true { self?.model.engineJob = nil }
+            self?.engSig = ""
+            self?.updateEngines()
+            self?.fitHeight()
+        }
+        let remove = rowButton("Remove", width: 58)
+        remove.contentTintColor = .systemRed
+        remove.hasDestructiveAction = true
+        remove.isEnabled = blocker == nil && p.plan != nil && !p.busy && p.error == nil
+        remove.onAction = { [weak self, weak app] in
+            guard let self, let app else { return }
+            self.pendingEngineRemoval?.busy = true
+            self.engSig = ""
+            self.updateEngines()
+            app.removeEngine(k) { [weak self] error in
+                guard let self else { return }
+                if let error {
+                    self.pendingEngineRemoval?.busy = false
+                    self.pendingEngineRemoval?.error = error
+                } else {
+                    self.pendingEngineRemoval = nil
+                }
+                self.engSig = ""
+                self.updateEngines()
+                self.fitHeight()
+            }
+        }
+
+        let h = hstack()
+        h.alignment = .centerY
+        h.spacing = 6
+        h.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 8)
+        h.translatesAutoresizingMaskIntoConstraints = false
+        h.addView(text, in: .leading)
+        h.addView(cancel, in: .trailing)
+        h.addView(remove, in: .trailing)
+        row.addSubview(h)
+        NSLayoutConstraint.activate([
+            h.topAnchor.constraint(equalTo: row.topAnchor),
+            h.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            h.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            h.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+        ])
+        return row
+    }
+
     // MARK: library
 
     private func buildLibrary(in lib: NSStackView) {
@@ -4200,12 +5646,17 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
         libDupLabel = uiLabel("", 10.5, .regular, .systemOrange)
         libDupLabel.lineBreakMode = .byTruncatingTail
         addFull(libDupLabel, to: lib, after: 10)
+        addFull(hfJobRow, to: lib, after: 8)
 
         libSearch = NSSearchField()
         libSearch.controlSize = .small
         libSearch.font = uiFont(12)
-        libSearch.placeholderString = "Filter models"
+        libSearch.placeholderString = "Search your models and Hugging Face"
+        libSearch.toolTip = "Filters your models as you type; after a pause (or Return) also searches Hugging Face for GGUF and MLX models"
         libSearch.delegate = self
+        libSearch.sendsWholeSearchString = true      // the action fires on Return and on clear
+        libSearch.target = self
+        libSearch.action = #selector(libSearchSubmitted)
         libSearch.setContentHuggingPriority(.defaultLow, for: .horizontal)
         libFilter = NSSegmentedControl(labels: ["All", "★", "Unused"], trackingMode: .selectOne,
                                        target: self, action: #selector(libFilterChanged))
@@ -4262,6 +5713,7 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
         guard (obj.object as? NSSearchField) === libSearch else { return }
         updateLibrary()
         fitHeight()
+        searchHFFromLibrary(now: false)
     }
 
     private func updateLibrary() {
@@ -4318,6 +5770,20 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
             let blockers = m.instances.filter { p.ids.contains($0.id) }.compactMap { app.deleteBlocker($0) }
             sig += "del:\(p.key):\(p.ids):\(p.busy):\(p.error ?? ""):\(blockers)"
         }
+        // Hugging Face results for the same query, below your own models (All filter only)
+        let results = model.hfResults
+        if let open = hfExpanded, !results.contains(where: { $0.id == open }) { hfExpanded = nil }
+        if hfExpandFirst, !model.hfSearching, let first = results.first {
+            hfExpandFirst = false
+            hfExpanded = first.id
+            app.fetchHFDetail(first.id, format: first.format)
+        }
+        let showHF = mode == 0 && !query.isEmpty && (model.hfSearching || !results.isEmpty || model.hfError != nil)
+        let have = diskIDs
+        if showHF {
+            sig += "|hf:\(model.hfSearching):\(model.hfError ?? ""):\(model.hfQuery):\(hfExpanded ?? ""):\(hfRecentOnly):\(have.count):"
+            sig += results.map(\.id).joined(separator: ",")
+        }
         guard sig != libSig else { return }
         libSig = sig
 
@@ -4337,7 +5803,7 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
             else { add(makeLibraryRow(m, live: live.contains(m.key))) }
         }
         if shown.isEmpty {
-            let text = !query.isEmpty ? "No models match “\(query)”"
+            let text = !query.isEmpty ? "No models on disk match “\(query)”"
                 : mode == 1 ? "No favorites yet — star a model to pin it"
                 : mode == 2 ? "Nothing unused for 30 days" : "No models on disk"
             add(ModelRowView(ModelRow(dot: .tertiaryLabelColor, hollow: true, name: text, dimName: true)))
@@ -4349,8 +5815,33 @@ final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
         }
         rest.forEach(row)
 
+        if showHF {
+            let h = hstack()
+            h.alignment = .centerY
+            h.spacing = 8
+            h.edgeInsets = NSEdgeInsets(top: 10, left: 2, bottom: 2, right: 0)
+            h.addArrangedSubview(eyebrow("ON HUGGING FACE"))
+            let meta = model.hfSearching ? "searching…" : results.isEmpty ? "" : "\(results.count) result\(results.count == 1 ? "" : "s")"
+            h.addView(uiLabel(meta, 10.5, .regular, .secondaryLabelColor, mono: true), in: .trailing)
+            let recent = NSButton(checkboxWithTitle: "Last 90 days", target: self, action: #selector(hfRecentToggled(_:)))
+            recent.controlSize = .small
+            recent.font = uiFont(11)
+            recent.state = hfRecentOnly ? .on : .off
+            recent.toolTip = "Only repos created in the last 90 days"
+            h.addView(recent, in: .trailing)
+            add(h)
+            if let err = model.hfError, !model.hfSearching {
+                add(ModelRowView(ModelRow(dot: .tertiaryLabelColor, hollow: true, name: err, dimName: true)))
+            }
+            for r in results {
+                let open = hfExpanded == r.id
+                add(makeHFResultRow(r, expanded: open, have: have.contains(r.id.lowercased())))
+                if open { add(hfCard) }
+            }
+        }
+
         libList.layoutSubtreeIfNeeded()
-        libScrollHeight.constant = min(ceil(libList.fittingSize.height), 430)
+        libScrollHeight.constant = min(ceil(libList.fittingSize.height), 480)
     }
 
     private func badge(_ b: Backend) -> NSView {
