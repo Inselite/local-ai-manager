@@ -1,5 +1,7 @@
 # Local AI Manager
 
+**Requires Apple Silicon (M1 or later) and macOS 26 Tahoe or later.**
+
 A macOS menu-bar app for the local LLMs on your Mac. It shows what is loaded and how much RAM it takes, and it lets you load, favorite, download and safely delete models across **Ollama**, **MLX** and **[Splash](https://github.com/incoai/splash)** (or its M5-tuned fork **[Splish](https://github.com/publicExcess/splish)**) from one list. It also installs, updates and removes the engines themselves.
 
 <p>
@@ -33,10 +35,9 @@ A history of loads, unloads, downloads, deletes and engine changes is kept local
 
 ## Requirements
 
-- A Mac with Apple silicon, running **macOS 26** or later.
-- Xcode Command Line Tools, to build: `xcode-select --install`.
-- At least one backend. You can install any of them from the **Engines** tab later:
-  - [Ollama](https://ollama.com), running on the default port 11434.
+- Apple Silicon (M1 or later) and **macOS 26 Tahoe** or later.
+- At least one backend to run models. You can install any of them from the **Engines** tab later:
+  - [Ollama](https://ollama.com), running locally (default port 11434; see [Custom endpoints](#custom-endpoints)).
   - [Splash](https://github.com/incoai/splash): the `splash` CLI in `~/.local/bin` or Homebrew.
   - [Splish](https://github.com/publicExcess/splish), the community fork of Splash tuned for M5 GPUs: a built checkout in `~/splish` (or see [Splash and Splish](#splash-and-splish)).
   - MLX: a Python environment with `mlx-lm` (optionally `mlx-vlm`) and `huggingface_hub`. See [MLX setup](#mlx-setup).
@@ -44,6 +45,24 @@ A history of loads, unloads, downloads, deletes and engine changes is kept local
   The MLX and Splash sections only appear when that backend is installed.
 
 ## Install
+
+### Option 1: download the release zip
+
+Download `Local-AI-Manager-0.9.0.zip` from the [GitHub release](https://github.com/Inselite/local-ai-manager/releases/tag/v0.9.0), unzip it, and drag **Local AI Manager.app** into `/Applications`. Open it and look for the memory-chip icon in the menu bar.
+
+The app is **ad-hoc signed and not notarized**, so macOS will block the first launch. After trying to open it, go to **System Settings → Privacy & Security → Open Anyway**, then confirm **Open** ([Apple’s instructions](https://support.apple.com/en-us/102445)). Alternatively, remove the downloaded app's quarantine flag in Terminal:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Local AI Manager.app"
+```
+
+To start the downloaded app at login, enable **⋯ → Open at Login**. It is off by default and uses macOS's [`SMAppService.mainApp`](https://developer.apple.com/documentation/servicemanagement/smappservice/mainapp) login item. You can also manage it in **System Settings → General → Login Items & Extensions**. The toggle is hidden and off when a Local AI Manager LaunchAgent is present, including the one created by `install.sh`, to avoid launching twice. Move the app to its final location before enabling it.
+
+To update, quit the app and replace it with the new release. To remove it, turn off **Open at Login**, quit, and move the app to the Trash. Your models are not touched.
+
+### Option 2: build from source
+
+Building requires Xcode Command Line Tools (`xcode-select --install`), **Swift 6.2 or later**, and the **macOS 26 SDK or later** ([Xcode 26 or later](https://developer.apple.com/xcode/system-requirements)). The release was built with Apple Swift 6.4. There are no third-party Swift dependencies or Xcode project.
 
 ```sh
 git clone https://github.com/Inselite/local-ai-manager.git
@@ -54,6 +73,31 @@ cd local-ai-manager
 This builds the app, copies it to `~/Applications/Local AI Manager.app`, and adds a LaunchAgent so it starts at login and restarts if it crashes. Quitting from the menu keeps it quit until the next login. Look for the memory-chip icon in the menu bar.
 
 To update, run `git pull` and then `./scripts/install.sh` again. To remove it, run `./scripts/uninstall.sh`; your models are not touched.
+
+To build without installing or changing login startup:
+
+```sh
+./scripts/build.sh      # → build/Local AI Manager.app
+```
+
+The version is defined in `Resources/Info.plist` and copied into the app by `build.sh`.
+
+## Custom endpoints
+
+Ollama uses `http://127.0.0.1:11434` by default. Set `ollamaHost` for a custom local endpoint; an inherited `OLLAMA_HOST` also works. Menu-bar apps usually don't inherit your shell's environment, so prefer the setting:
+
+```sh
+defaults write io.github.inselite.LocalAIManager ollamaHost http://127.0.0.1:12345
+```
+
+Splash/Splish LaunchAgents are discovered by their `splash serve` or `splish serve` command, regardless of label or plist filename. Their model and port come from the command arguments. The app's own Splash and MLX slots reuse their saved ports, defaulting to 8000 and 8081. To choose different ports:
+
+```sh
+defaults write io.github.inselite.LocalAIManager splashPort -int 8002
+defaults write io.github.inselite.LocalAIManager mlxPort -int 8082
+```
+
+Restart the manager after changing settings. Pick ports not used by unrelated services. The app only replaces servers it recognizes on its slot's port.
 
 ## MLX setup
 
@@ -117,22 +161,24 @@ Servers you want listed (and startable) go in `~/Library/Application Support/Loc
 ```json
 [
   {
-    "name": "Qwen3 8B",
+    "name": "My MLX model",
     "port": 8080,
-    "binary": "/Users/you/.venv-mlx/bin/mlx_lm.server",
-    "args": ["--model", "mlx-community/Qwen3-8B-4bit", "--port", "8080"]
+    "binary": "~/.venv-mlx/bin/mlx_lm.server",
+    "args": ["--model", "~/models/my-mlx-model", "--port", "8080"]
   }
 ]
 ```
 
-The app adds its own entry (`"panel": true`, port 8081) when you load an MLX model from the menu. It leaves hand-written entries alone.
+Replace the model path with your downloaded MLX model folder (or a Hugging Face repo ID). `~` is expanded in the binary and path arguments.
+
+The app adds its own entry (`"panel": true`, default port 8081) when you load an MLX model from the menu. It leaves hand-written entries alone.
 
 ## Where things are stored
 
 | What | Where |
 |---|---|
 | Favorites, usage stats, history, MLX servers | `~/Library/Application Support/Local AI Manager/` |
-| Settings (tab, *Last 90 days*, `mlxBinDir`, `splishDir`, `splashEngine`) | `defaults read io.github.inselite.LocalAIManager` |
+| Settings (tab, *Last 90 days*, `mlxBinDir`, `splishDir`, `splashEngine`, custom endpoints) | `defaults read io.github.inselite.LocalAIManager` |
 | App log | `/tmp/local-ai-manager.log` |
 | Engine install and update output | `/tmp/local-ai-manager-engine.log` |
 | Splash model started from the app | LaunchAgent `io.github.inselite.LocalAIManager.splash`, log `/tmp/local-ai-manager-splash.log` |
@@ -158,14 +204,6 @@ B="$HOME/Applications/Local AI Manager.app/Contents/MacOS/LocalAIManager"
 "$B" --window --hf-search qwen       # open the Library tab searching for "qwen", first Hugging Face result expanded
 ```
 
-## Building by hand
-
-Everything is one Swift file, with no Xcode project and no dependencies:
-
-```sh
-./scripts/build.sh      # → build/Local AI Manager.app
-```
-
 ## License
 
-MIT. Splash, Ollama and MLX are separate projects with their own licenses; this app only talks to them.
+[MIT](LICENSE); the release app also includes a copy in `Contents/Resources/LICENSE`. Splash, Ollama and MLX are separate projects with their own licenses; this app only talks to them.

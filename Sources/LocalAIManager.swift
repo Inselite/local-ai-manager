@@ -4,9 +4,10 @@ import Darwin
 import QuartzCore
 import ScreenCaptureKit
 import CryptoKit
+import ServiceManagement
 
 // Local AI Manager — menu bar app to run, find and clean up local LLMs (Ollama, MLX, Splash).
-// macOS 27 Liquid Glass style: NSGlassEffectView popover, Activity-Monitor-style
+// macOS 26 Liquid Glass style: NSGlassEffectView popover, Activity-Monitor-style
 // scrolling memory-pressure graph, per-model RAM rows with eject controls.
 //
 // Data sources:
@@ -17,10 +18,20 @@ import CryptoKit
 
 /// Where the app keeps its own files. Moved once from the app's former folder.
 enum AppPaths {
+    // Foundation can ignore HOME on macOS; honor it for portable paths and scratch-home checks.
+    static let home = ProcessInfo.processInfo.environment["HOME"].flatMap { $0.isEmpty ? nil : $0 }
+        ?? NSHomeDirectory()
+
+    static func expand(_ path: String) -> String {
+        if path == "~" { return home }
+        if path.hasPrefix("~/") { return home + path.dropFirst() }
+        return NSString(string: path).expandingTildeInPath
+    }
+
     static let stateDir: String = {
         let fm = FileManager.default
-        let dir = NSString(string: "~/Library/Application Support/Local AI Manager").expandingTildeInPath
-        let legacy = NSString(string: "~/.llmpanel").expandingTildeInPath
+        let dir = AppPaths.expand("~/Library/Application Support/Local AI Manager")
+        let legacy = AppPaths.expand("~/.llmpanel")
         if !fm.fileExists(atPath: dir) && fm.fileExists(atPath: legacy) {
             try? fm.moveItem(atPath: legacy, toPath: dir)
         }
@@ -32,8 +43,53 @@ enum AppPaths {
 
     /// First existing executable among the usual install locations.
     static func firstExecutable(_ candidates: [String]) -> String? {
-        candidates.map { NSString(string: $0).expandingTildeInPath }
+        candidates.map { AppPaths.expand($0) }
             .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    static func flag(_ flag: String, in args: [String]) -> String? {
+        if let i = args.firstIndex(of: flag), i + 1 < args.count { return args[i + 1] }
+        return args.first { $0.hasPrefix(flag + "=") }.map { String($0.dropFirst(flag.count + 1)) }
+    }
+
+    /// Read launchd's executable and argv without depending on its label or plist filename.
+    static func agentCommand(_ plist: [String: Any]) -> (exe: String, args: [String])? {
+        let argv = plist["ProgramArguments"] as? [String] ?? []
+        guard let program = plist["Program"] as? String ?? argv.first else { return nil }
+        var exe = AppPaths.expand(program)
+        var args = Array(argv.dropFirst())
+        if (exe as NSString).lastPathComponent == "env" {
+            // The common `env splash serve …` form, including environment assignments.
+            while let first = args.first, first.contains("=") && !first.hasPrefix("--") { args.removeFirst() }
+            guard let command = args.first else { return nil }
+            exe = AppPaths.expand(command)
+            args.removeFirst()
+        }
+        return (exe, args)
+    }
+
+    static func userAgents() -> [(path: String, label: String, plist: [String: Any])] {
+        let dir = AppPaths.expand("~/Library/LaunchAgents")
+        return ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).sorted().compactMap { file in
+            guard file.hasSuffix(".plist") else { return nil }
+            let path = (dir as NSString).appendingPathComponent(file)
+            guard let data = FileManager.default.contents(atPath: path),
+                  let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+                  let label = plist["Label"] as? String else { return nil }
+            return (path, label, plist)
+        }
+    }
+
+    static var hasAppLoginAgent: Bool {
+        userAgents().contains { agent in
+            guard let command = agentCommand(agent.plist) else { return false }
+            return (command.exe as NSString).lastPathComponent == "LocalAIManager"
+        }
+    }
+
+    static func port(_ key: String, fallback: Int) -> Int {
+        let value = UserDefaults.standard.integer(forKey: key)
+        return (1...65535).contains(value) ? value : fallback
     }
 }
 
@@ -516,7 +572,12 @@ final class PressureGraphView: NSView {
     private var refreshTimer: Timer?
     private var tickCount = 0
 
-    let ollamaBase = "http://127.0.0.1:11434"
+    let ollamaBase: String = {
+        let host = UserDefaults.standard.string(forKey: "ollamaHost")
+            ?? ProcessInfo.processInfo.environment["OLLAMA_HOST"] ?? "http://127.0.0.1:11434"
+        let url = host.contains("://") ? host : "http://" + host
+        return url.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }()
     let store = LibraryStore()
     var sessions: [String: LiveSession] = [:]
     var panelIntents: [String: Date] = [:]     // "backend|ref" → when the panel asked to load/unload it
@@ -527,7 +588,7 @@ final class PressureGraphView: NSView {
     var engineScanInFlight = false
     private weak var debugContent: PanelContentView?   // the `--window` panel, updated like the popover
     let mlxConfigPath = "\(AppPaths.stateDir)/mlx_servers.json"
-    let launchAgentsDir = NSString(string: "~/Library/LaunchAgents").expandingTildeInPath
+    let launchAgentsDir = AppPaths.expand("~/Library/LaunchAgents")
 
     // MARK: lifecycle
 
@@ -580,6 +641,11 @@ final class PressureGraphView: NSView {
         }
         loadMlxConfig()
         loadSplashAgents()
+        // The source installer owns login startup. Never add a second login mechanism.
+        if !CommandLine.arguments.contains("--window"), AppPaths.hasAppLoginAgent,
+           SMAppService.mainApp.status != .notRegistered {
+            try? SMAppService.mainApp.unregister()
+        }
         rescanLibrary()
         rescanEngines { [weak self] in
             if self?.enginesStale(hours: 12) == true { self?.checkEngineUpdates() }
@@ -807,7 +873,7 @@ final class PressureGraphView: NSView {
             let args = d["args"] as? [String] ?? []
             var weightsGB: Double = 0
             if let mi = args.firstIndex(of: "--model"), mi + 1 < args.count {
-                let rawDir = args[mi + 1]
+                let rawDir = AppPaths.expand(args[mi + 1])
                 let dir = (rawDir as NSString).resolvingSymlinksInPath
                 if let files = try? FileManager.default.contentsOfDirectory(atPath: dir) {
                     for f in files where f.hasSuffix(".safetensors") {
@@ -822,9 +888,9 @@ final class PressureGraphView: NSView {
             }
             return MlxServerState(
                 name: d["name"] as? String ?? "server",
-                port: d["port"] as? Int ?? 8080,
-                binary: d["binary"] as? String ?? "",
-                args: args,
+                port: d["port"] as? Int ?? AppPaths.flag("--port", in: args).flatMap(Int.init) ?? 8080,
+                binary: AppPaths.expand(d["binary"] as? String ?? ""),
+                args: args.map { $0.hasPrefix("~/") ? AppPaths.expand($0) : $0 },
                 weightsGB: weightsGB,
                 keepRunning: d["keep_running"] as? Bool ?? false,
                 configured: true,
@@ -1043,9 +1109,15 @@ final class PressureGraphView: NSView {
 
     // MARK: Splash
 
-    static let splashCLI = AppPaths.firstExecutable(["~/.local/bin/splash", "/opt/homebrew/bin/splash", "/usr/local/bin/splash"])
-        ?? NSString(string: "~/.local/bin/splash").expandingTildeInPath
-    static let splashModelsDir = NSString(string: "~/Library/Application Support/Splash/models").expandingTildeInPath
+    static let splashCLI = AppPaths.firstExecutable(
+        ["~/.local/bin/splash", "/opt/homebrew/bin/splash", "/usr/local/bin/splash"]
+        + AppPaths.userAgents().compactMap { agent in
+            guard let command = AppPaths.agentCommand(agent.plist),
+                  (command.exe as NSString).lastPathComponent == "splash" else { return nil }
+            return command.exe
+        })
+        ?? AppPaths.expand("~/.local/bin/splash")
+    static let splashModelsDir = AppPaths.expand("~/Library/Application Support/Splash/models")
 
     /// A Splish checkout (github.com/publicExcess/splish, a Splash fork tuned for M5 GPUs): the
     /// `splishDir` setting, else a checkout seen in a LaunchAgent or process, else a usual clone
@@ -1057,10 +1129,15 @@ final class PressureGraphView: NSView {
         var candidates: [String] = []
         if let dir = UserDefaults.standard.string(forKey: "splishDir"), !dir.isEmpty { candidates.append(dir) }
         if let hint { candidates.append(hint) }
+        candidates += AppPaths.userAgents().compactMap { agent in
+            guard let command = AppPaths.agentCommand(agent.plist),
+                  (command.exe as NSString).lastPathComponent == "splish" else { return nil }
+            return (command.exe as NSString).deletingLastPathComponent
+        }
         candidates += ["~/splish", "~/src/splish", "~/Developer/splish", "~/code/splish",
                        "~/projects/splish", "~/git/splish", "~/GitHub/splish"]
         // resolved, so it compares equal to the resolved install and assembly paths
-        return candidates.map { (NSString(string: $0).expandingTildeInPath as NSString).resolvingSymlinksInPath }
+        return candidates.map { (AppPaths.expand($0) as NSString).resolvingSymlinksInPath }
             .first { fm.isExecutableFile(atPath: "\($0)/splish") && fm.fileExists(atPath: "\($0)/install/launcher.py") }
     }
 
@@ -1093,7 +1170,11 @@ final class PressureGraphView: NSView {
     /// The panel's own Splash slot. Its plist is rewritten whenever a model is picked in
     /// the panel; it never starts at login and launchd never restarts it.
     static let panelSplashLabel = "\(AppPaths.agentPrefix).splash"
-    static let panelSplashPort = 8000
+    static var panelSplashPort: Int {
+        let agent = AppPaths.userAgents().first { $0.label == panelSplashLabel }
+        let args = agent.flatMap { AppPaths.agentCommand($0.plist)?.args } ?? []
+        return AppPaths.port("splashPort", fallback: AppPaths.flag("--port", in: args).flatMap(Int.init) ?? 8000)
+    }
     static let panelSplashLog = "\(AppPaths.logPrefix)-splash.log"
 
     private typealias SplashProc = (pid: Int, ppid: Int, port: Int, model: String?, serving: Bool, engine: String, root: String)
@@ -1101,24 +1182,21 @@ final class PressureGraphView: NSView {
     /// LaunchAgents whose program is the `splash` CLI with `serve` become start-able rows.
     private func loadSplashAgents() {
         AppDelegate.splishRoot = AppDelegate.findSplishRoot(hint: AppDelegate.splishRoot)
-        let files = (try? FileManager.default.contentsOfDirectory(atPath: launchAgentsDir)) ?? []
         var agents: [SplashServerState] = []
-        for f in files.sorted() where f.hasSuffix(".plist") {
-            let path = (launchAgentsDir as NSString).appendingPathComponent(f)
+        for agent in AppPaths.userAgents() {
+            let plist = agent.plist, label = agent.label
             guard
-                let data = FileManager.default.contents(atPath: path),
-                let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-                let label = plist["Label"] as? String,
-                let args = plist["ProgramArguments"] as? [String],
-                let exe = args.first, ["splash", "splish"].contains((exe as NSString).lastPathComponent),
-                args.contains("serve")
+                let command = AppPaths.agentCommand(plist),
+                ["splash", "splish"].contains((command.exe as NSString).lastPathComponent),
+                command.args.first == "serve"
             else { continue }
+            let exe = command.exe, args = command.args
             let isSplish = (exe as NSString).lastPathComponent == "splish"
             if isSplish, AppDelegate.splishRoot == nil {
                 AppDelegate.splishRoot = AppDelegate.findSplishRoot(hint: (exe as NSString).deletingLastPathComponent)
             }
             func arg(_ flag: String) -> String? {
-                args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
+                AppPaths.flag(flag, in: args)
             }
             agents.append(SplashServerState(
                 port: arg("--port").flatMap(Int.init) ?? 8000, label: label,
@@ -1192,7 +1270,7 @@ final class PressureGraphView: NSView {
             let cmd = String(parts[2])
             func capture(_ pattern: String) -> String? {
                 guard let r = cmd.range(of: pattern, options: .regularExpression) else { return nil }
-                return cmd[r].split(separator: " ").last.map(String.init)
+                return cmd[r].split(whereSeparator: { $0 == " " || $0 == "=" }).last.map(String.init)
             }
             // the checkout the scripts run from; only Splash-shaped folders count
             guard let script = cmd.split(separator: " ").first(where: {
@@ -1201,8 +1279,8 @@ final class PressureGraphView: NSView {
             let root = ((String(script) as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
             guard FileManager.default.fileExists(atPath: "\(root)/install/launcher.py") else { continue }
             let splish = FileManager.default.isExecutableFile(atPath: "\(root)/splish")
-            procs.append((pid, ppid, capture("--port [0-9]+").flatMap(Int.init) ?? 8000,
-                          capture("--model [^ ]+"), cmd.contains("server/server.py"),
+            procs.append((pid, ppid, capture("--port[ =][0-9]+").flatMap(Int.init) ?? 8000,
+                          capture("--model[ =][^ ]+"), cmd.contains("server/server.py"),
                           splish ? "Splish" : "Splash", root))
         }
         // a launcher that forked its server would show up twice — keep the server
@@ -1392,7 +1470,7 @@ final class PressureGraphView: NSView {
     }
 
     private func writePanelSplashAgent(model modelID: String, languageOnly: Bool, engine: String) {
-        let home = NSHomeDirectory()
+        let home = AppPaths.home
         let cli = engine == "Splish" ? AppDelegate.splishRoot.map { "\($0)/splish" } ?? AppDelegate.splashCLI
                                      : AppDelegate.splashCLI
         let plist: [String: Any] = [
@@ -1433,7 +1511,8 @@ final class PressureGraphView: NSView {
         let domain = "gui/\(getuid())"
         if AppDelegate.launchctl(["kickstart", "\(domain)/\(label)"]) != 0 {
             // not bootstrapped (e.g. after a bootout) — load it, then start it
-            let plist = (launchAgentsDir as NSString).appendingPathComponent("\(label).plist")
+            let plist = AppPaths.userAgents().first { $0.label == label }?.path
+                ?? (launchAgentsDir as NSString).appendingPathComponent("\(label).plist")
             _ = AppDelegate.launchctl(["bootstrap", domain, plist])
             _ = AppDelegate.launchctl(["kickstart", "\(domain)/\(label)"])
         }
@@ -1482,7 +1561,7 @@ final class PressureGraphView: NSView {
 
     /// Read once from the huggingface_hub token file, so gated repos list and resolve.
     private lazy var hfToken: String? = {
-        let path = NSString(string: "~/.cache/huggingface/token").expandingTildeInPath
+        let path = AppPaths.expand("~/.cache/huggingface/token")
         return (try? String(contentsOfFile: path, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }()
@@ -1669,8 +1748,19 @@ final class PressureGraphView: NSView {
         }
     }
 
-    /// Architectures Splash's GGUF loader accepts (splash-1.1.0/install/gguf.py TEXT_MODEL_TYPES).
-    static let splashArchitectures: Set<String> = ["qwen35", "qwen35moe"]
+    /// Read the selected engine's GGUF capabilities; unknown layouts are left to the engine.
+    var splashArchitectures: Set<String>? {
+        let root = preferredSplashEngine == "Splish" ? AppDelegate.splishRoot
+            : EngineScanner.releaseRoot(wrapper: AppDelegate.splashCLI)
+        guard let root, let text = try? String(contentsOfFile: "\(root)/install/gguf.py", encoding: .utf8),
+              let range = text.range(of: #"(?s)TEXT_MODEL_TYPES\s*=\s*\{[^}]*\}"#, options: .regularExpression),
+              let regex = try? NSRegularExpression(pattern: #"["']([^"']+)["']\s*:"#) else { return nil }
+        let table = String(text[range])
+        let names = regex.matches(in: table, range: NSRange(table.startIndex..., in: table)).compactMap {
+            Range($0.range(at: 1), in: table).map { String(table[$0]) }
+        }
+        return names.isEmpty ? nil : Set(names)
+    }
 
     /// Pull `hf.co/<repo>:<tag>` through Ollama's API with live progress, then load it.
     func pullToOllama(repo: String, tag: String) {
@@ -1742,18 +1832,22 @@ final class PressureGraphView: NSView {
     /// folder of a configured server, else a venv in a usual place.
     private var mlxBinDir: String {
         if let dir = UserDefaults.standard.string(forKey: "mlxBinDir"), !dir.isEmpty {
-            return NSString(string: dir).expandingTildeInPath
+            return AppPaths.expand(dir)
         }
         if let dir = model.mlxServers.first(where: { $0.configured && !$0.binary.isEmpty })
             .map({ ($0.binary as NSString).deletingLastPathComponent }) { return dir }
         let found = AppPaths.firstExecutable(["~/.venv-mlx/bin/mlx_lm.server", "~/.venv/bin/mlx_lm.server",
                                              "~/mlx/bin/mlx_lm.server", "~/.local/pipx/venvs/mlx-lm/bin/mlx_lm.server"])
-        return found.map { ($0 as NSString).deletingLastPathComponent } ?? NSString(string: "~/.venv-mlx/bin").expandingTildeInPath
+        return found.map { ($0 as NSString).deletingLastPathComponent } ?? AppPaths.expand("~/.venv-mlx/bin")
     }
     /// Whether an MLX Python environment was found (the MLX section hides without one).
     var hasMlxEnv: Bool { FileManager.default.isExecutableFile(atPath: "\(mlxBinDir)/python") }
-    static let panelMlxPort = 8081
-    static let hfHubDir = NSString(string: "~/.cache/huggingface/hub").expandingTildeInPath
+    static var panelMlxPort: Int {
+        let entries = (try? Data(contentsOf: URL(fileURLWithPath: "\(AppPaths.stateDir)/mlx_servers.json")))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [[String: Any]] } ?? []
+        return AppPaths.port("mlxPort", fallback: entries.first { $0["panel"] as? Bool == true }?["port"] as? Int ?? 8081)
+    }
+    static let hfHubDir = AppPaths.expand("~/.cache/huggingface/hub")
     private var mlxDownload: Process?
     private var panelMlxProcess: Process?
 
@@ -1948,7 +2042,7 @@ final class PressureGraphView: NSView {
         mlxDownload = nil
     }
 
-    /// Point the panel's MLX slot (:8081) at a model snapshot and start it; replaces what ran there.
+    /// Point the panel's MLX slot at a model snapshot and start it; replaces what ran there.
     func serveInMlx(path: String, repo: String, server: String) {
         let port = AppDelegate.panelMlxPort
         notePanelIntent(.mlx, path)
@@ -2167,7 +2261,7 @@ struct LibrarySnapshot {
 enum LibraryScanner {
     static var ollamaModelsDir: String {
         if let dir = ProcessInfo.processInfo.environment["OLLAMA_MODELS"], !dir.isEmpty { return dir }
-        return NSString(string: "~/.ollama/models").expandingTildeInPath
+        return AppPaths.expand("~/.ollama/models")
     }
 
     /// Repos in the HF cache that belong to other tools (speech, image models).
@@ -2223,7 +2317,7 @@ enum LibraryScanner {
         return ((try? fm.contentsOfDirectory(atPath: snaps)) ?? []).map { "\(snaps)/\($0)" }.max { modified($0) < modified($1) }
     }
 
-    /// "UD-Q4_K_M" from "…/Qwen3.8-27B-UD-Q4_K_M-00001-of-00002.gguf"; nil for projectors, imatrix, MTP heads.
+    /// "UD-Q4_K_M" from "…/model-UD-Q4_K_M-00001-of-00002.gguf"; nil for projectors, imatrix, MTP heads.
     static func ggufQuantTag(_ path: String) -> String? {
         let lower = path.lowercased()
         guard lower.hasSuffix(".gguf") else { return nil }
@@ -2272,7 +2366,7 @@ enum LibraryScanner {
 
     /// Splash's prepared copies of model weights (one folder per tensor group). Splash and Splish
     /// share this cache. Not removed by Splash's own garbage collection.
-    static let splashWeightCache = NSString(string: "~/Library/Caches/Splash/weights").expandingTildeInPath
+    static let splashWeightCache = AppPaths.expand("~/Library/Caches/Splash/weights")
 
     /// One prepared entry. The engine finds entries by the content they were prepared from, so an
     /// install reuses an entry another install (or the other engine) prepared from the same files;
@@ -2528,7 +2622,7 @@ enum LibraryScanner {
 
         var unique: [String: Double] = [:]
         for m in models.values { for i in m.instances { for (p, b) in i.files { unique[p] = b } } }
-        let free = (try? URL(fileURLWithPath: NSHomeDirectory())
+        let free = (try? URL(fileURLWithPath: AppPaths.home)
             .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage.map(Double.init) ?? 0
 
@@ -3144,7 +3238,7 @@ enum EngineKind: String, CaseIterable {
     var blurb: String {
         switch self {
         case .ollama: return "Runs GGUF models from its own library"
-        case .splash: return "Inco's engine for Qwen3.8 and Qwen3.6, with DFlash drafts"
+        case .splash: return "Inco's local inference engine, with speculative decoding"
         case .splish: return "Community Splash fork tuned for M5 GPUs · builds from source"
         case .mlx: return "mlx-lm and mlx-vlm servers in a Python environment"
         }
@@ -3218,9 +3312,9 @@ struct EngineRemovalPlan {
 }
 
 enum EngineScanner {
-    static let home = NSHomeDirectory()
-    static let path = "\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-    static let ollamaApps = ["/Applications/Ollama.app", "\(NSHomeDirectory())/Applications/Ollama.app"]
+    static let home = AppPaths.home
+    static let path = "\(AppPaths.home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    static let ollamaApps = ["/Applications/Ollama.app", "\(AppPaths.home)/Applications/Ollama.app"]
     static let ollamaTeam = "3MU9H2V9Y9"     // Ollama's Developer ID: updates must carry the same signature
     static var splishInstallDir: String { "\(home)/splish" }
     static var mlxInstallVenv: String { "\(home)/.venv-mlx" }
@@ -3264,7 +3358,7 @@ enum EngineScanner {
         return (total.flatMap { Double($0) } ?? 0) * 1024
     }
 
-    /// The release folder a `splash` wrapper script runs (…/splash-1.1.0), if it runs one.
+    /// The release folder a `splash` wrapper script runs, regardless of its version or location.
     static func releaseRoot(wrapper: String) -> String? {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: wrapper),
               attrs[.type] as? FileAttributeType == .typeRegular, ((attrs[.size] as? NSNumber)?.intValue ?? 0) < 4096,
@@ -3669,7 +3763,7 @@ extension AppDelegate {
         env["PATH"] = EngineScanner.path
         env["GIT_TERMINAL_PROMPT"] = "0"
         task.environment = env
-        task.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
+        task.currentDirectoryURL = URL(fileURLWithPath: AppPaths.home)
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = pipe
@@ -3761,7 +3855,7 @@ extension AppDelegate {
             withLatest(k, action: action) { [weak self] v in
                 self?.runEngineScript(k, action: action, script: EngineScripts.splashRelease, args: [v, AppDelegate.splashCLI]) { ok in
                     // the release it replaced goes to the Trash once the new one answers
-                    guard ok, let old, old != "\(NSHomeDirectory())/splash-\(v)",
+                    guard ok, let old, old != "\(AppPaths.home)/splash-\(v)",
                           FileManager.default.fileExists(atPath: "\(old)/release.json") else { return }
                     try? FileManager.default.trashItem(at: URL(fileURLWithPath: old), resultingItemURL: nil)
                 }
@@ -3793,12 +3887,10 @@ extension AppDelegate {
     private func engineAgents(_ k: EngineKind) -> [(path: String, label: String, plist: [String: Any])] {
         guard k == .splash || k == .splish else { return [] }
         var out: [(String, String, [String: Any])] = []
-        for f in ((try? FileManager.default.contentsOfDirectory(atPath: launchAgentsDir)) ?? []).sorted() where f.hasSuffix(".plist") {
-            let path = (launchAgentsDir as NSString).appendingPathComponent(f)
-            guard let data = FileManager.default.contents(atPath: path),
-                  let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-                  let label = plist["Label"] as? String,
-                  let exe = (plist["ProgramArguments"] as? [String])?.first else { continue }
+        for agent in AppPaths.userAgents() {
+            let path = agent.path, label = agent.label, plist = agent.plist
+            guard let command = AppPaths.agentCommand(plist) else { continue }
+            let exe = command.exe
             let name = (exe as NSString).lastPathComponent
             let real = (exe as NSString).resolvingSymlinksInPath
             let match = k == .splash
@@ -3909,8 +4001,16 @@ extension AppDelegate {
             if failure == nil {
                 for a in agents {
                     var plist = a.plist
-                    if let replacement, var args = plist["ProgramArguments"] as? [String] {
-                        args[0] = replacement
+                    if let replacement {
+                        var args = plist["ProgramArguments"] as? [String] ?? []
+                        let program = plist["Program"] as? String ?? args.first ?? ""
+                        if (program as NSString).lastPathComponent == "env",
+                           let i = args.indices.dropFirst().first(where: { !args[$0].contains("=") }) {
+                            args[i] = replacement
+                        } else {
+                            args = [replacement] + Array(args.dropFirst())
+                            if plist["Program"] != nil { plist["Program"] = replacement }
+                        }
                         plist["ProgramArguments"] = args
                         var env = plist["EnvironmentVariables"] as? [String: String] ?? [:]
                         // Splish reads the chip through sysctl and system_profiler (/usr/sbin)
@@ -3937,7 +4037,7 @@ extension AppDelegate {
                     }
                     if k == .splash || k == .splish { UserDefaults.standard.removeObject(forKey: "splashEngine") }
                     if k == .mlx, let bin = UserDefaults.standard.string(forKey: "mlxBinDir"),
-                       st.root.map({ NSString(string: bin).expandingTildeInPath.hasPrefix($0 + "/") }) == true {
+                       st.root.map({ AppPaths.expand(bin).hasPrefix($0 + "/") }) == true {
                         UserDefaults.standard.removeObject(forKey: "mlxBinDir")
                     }
                 } else {
@@ -4242,7 +4342,7 @@ private final class ModelRowView: HoverRowView {
 
 }
 
-final class PanelContentView: NSView, NSSearchFieldDelegate {
+final class PanelContentView: NSView, NSSearchFieldDelegate, NSMenuDelegate {
     private let model: PanelModel
     private weak var appDelegate: AppDelegate?
 
@@ -4684,12 +4784,42 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
             item.target = self
             more.menu?.addItem(item)
         }
+        let login = NSMenuItem(title: "Open at Login", action: #selector(menuLogin(_:)), keyEquivalent: "")
+        login.target = self
+        more.menu?.addItem(login)
+        more.menu?.delegate = self
         more.menu?.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Local AI Manager", action: #selector(menuQuit), keyEquivalent: "q")
         quit.target = self
         more.menu?.addItem(quit)
         more.toolTip = "More"
         return more
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard let login = menu.items.first(where: { $0.action == #selector(menuLogin(_:)) }) else { return }
+        login.isHidden = AppPaths.hasAppLoginAgent
+        login.state = !login.isHidden && SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    @objc private func menuLogin(_ item: NSMenuItem) {
+        guard !AppPaths.hasAppLoginAgent else { item.state = .off; item.isHidden = true; return }
+        do {
+            if SMAppService.mainApp.status == .enabled || SMAppService.mainApp.status == .requiresApproval {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+                if SMAppService.mainApp.status == .requiresApproval {
+                    SMAppService.openSystemSettingsLoginItems()
+                }
+            }
+            if let menu = item.menu { menuNeedsUpdate(menu) }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Couldn't change Open at Login"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
     }
 
     @objc private func menuRefresh() { refreshNow() }
@@ -5037,10 +5167,10 @@ final class PanelContentView: NSView, NSSearchFieldDelegate {
                 ? "Download hf.co/\(detail.id):\(q.tag) into Ollama, then load it"
                 : "Ollama isn't running"
             let arch = detail.architecture
-            let splashOK = arch.map { AppDelegate.splashArchitectures.contains($0) } ?? true
+            let splashOK = arch.flatMap { appDelegate?.splashArchitectures?.contains($0) } ?? true
             hfSplashButton.isEnabled = splashOK && !jobActive
             hfSplashButton.toolTip = !splashOK
-                ? "Splash runs Qwen3.5-family models only (this one is \(arch ?? "?"))"
+                ? "The selected engine doesn't support architecture \(arch ?? "?")"
                 : "Serve \(detail.id):\(q.tag) on :\(AppDelegate.panelSplashPort) — replaces the model running there"
                     + (arch == nil ? "\nArchitecture unknown — Splash may reject it" : "")
         }
